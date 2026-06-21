@@ -1,0 +1,35 @@
+{
+  "name": "yzs-frontend",
+  "version": "1.0.0",
+  "description": "云值守系统前端",
+  "productName": "云值守系统",
+  "scripts": {
+    "dev": "quasar dev",
+    "build": "quasar build -m spa",
+    "build:electron": "quasar build -m electron",
+    "build:android": "quasar build -m capacitor -T android",
+    "test": "playwright test",
+    "test:ui": "playwright test --ui",
+    "test:debug": "playwright test --debug",
+    "test:headed": "playwright test --headed",
+    "test:report": "playwright show-report",
+    "test:codegen": "playwright codegen http://localhost:9000"
+  },
+  "dependencies": {
+    "@quasar/extras": "^1.16.12",
+    "axios": "^1.7.2",
+    "echarts": "^6.0.0",
+    "pinia": "^2.1.7",
+    "quasar": "^2.16.9",
+    "vue": "^3.4.27",
+    "vue-router": "^4.3.2",
+    "xlsx": "^0.18.5"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.59.1",
+    "@quasar/app-vite": "^1.10.1",
+    "autoprefixer": "^10.4.19",
+    "sass": "^1.77.6",
+    "vite": "^2.9.18"
+  }
+}

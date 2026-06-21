@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(go mod:*)",
+      "Bash(GOPROXY=https://proxy.golang.org,direct go mod tidy)",
+      "Bash(npm install:*)",
+      "Bash(go build:*)",
+      "Bash(npm run:*)",
+      "Bash(go get:*)",
+      "Read(//d/WindTerm_2.6.0/temp/2026-04-08 15.48.53.647/47.108.52.145/opt/yzs/**)",
+      "Bash(node -e \"const p=require\\('./frontend/package.json'\\); const keys=[...Object.keys\\(p.dependencies||{}\\),...Object.keys\\(p.devDependencies||{}\\)]; console.log\\('quasar:', keys.filter\\(k=>k.includes\\('quasar'\\)\\)\\); console.log\\('element:', keys.filter\\(k=>k.includes\\('element'\\)\\)\\);\")",
+      "Bash(python -c \"import sys,json; p=json.load\\(sys.stdin\\); deps={**p.get\\('dependencies',{}\\),**p.get\\('devDependencies',{}\\)}; print\\('quasar:', [k for k in deps if 'quasar' in k]\\); print\\('element:', [k for k in deps if 'element' in k]\\)\")",
+      "Bash(grep -r '$q\\\\.notify\\\\|$q\\\\.dialog' D:/project/go-yzs/frontend/src '--include=*.vue' -l)",
+      "WebFetch(domain:quasar.dev)"
+    ]
+  }
+}

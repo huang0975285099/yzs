@@ -1,0 +1,10 @@
+torch --index-url https://download.pytorch.org/whl/cu126
+torchvision --index-url https://download.pytorch.org/whl/cu126
+transformers
+faiss-cpu
+flask
+pillow
+opencv-python-headless
+numpy
+requests
+ultralytics

@@ -1,0 +1,532 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>商品识别</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+       background: #f0f2f5; color: #333; }
+
+.header { background: #fff; padding: 14px 24px; border-bottom: 1px solid #e8e8e8;
+          display: flex; align-items: center; gap: 12px; }
+.header h1 { font-size: 18px; font-weight: 600; }
+
+/* 标签页 */
+.tabs { display: flex; gap: 2px; background: #fff;
+        padding: 0 16px; border-bottom: 1px solid #e8e8e8; }
+.tab { padding: 12px 20px; cursor: pointer; font-size: 14px; color: #666;
+       border-bottom: 2px solid transparent; transition: all .15s; }
+.tab:hover { color: #1890ff; }
+.tab.active { color: #1890ff; border-bottom-color: #1890ff; font-weight: 600; }
+
+.layout { display: flex; gap: 16px; padding: 16px; height: calc(100vh - 97px); }
+
+/* 左侧公共 */
+.left { flex: 1; display: flex; flex-direction: column; gap: 10px; min-width: 0; max-width: 50%; }
+.panel { display: none; flex: 1; flex-direction: column; gap: 10px; }
+.panel.active { display: flex; }
+
+/* ── 视频面板 ── */
+.url-bar { background: #fff; border-radius: 8px; padding: 10px 14px;
+           display: flex; gap: 8px; }
+.url-bar input { flex: 1; border: 1px solid #d9d9d9; border-radius: 6px;
+                 padding: 7px 10px; font-size: 13px; outline: none; }
+.url-bar input:focus { border-color: #1890ff; }
+.url-bar button { padding: 7px 16px; background: #1890ff; color: #fff;
+                  border: none; border-radius: 6px; cursor: pointer; font-size: 13px; }
+
+.video-wrap { flex: 1; background: #000; border-radius: 8px; overflow: hidden;
+              display: flex; align-items: center; justify-content: center; }
+video { width: 100%; max-height: 100%; display: none; }
+#videoPlaceholder { color: #666; font-size: 14px; }
+
+.controls { background: #fff; border-radius: 8px; padding: 12px 14px;
+            display: flex; align-items: center; gap: 10px; }
+.time-lbl { font-size: 13px; color: #666; white-space: nowrap; }
+.time-lbl b { color: #333; }
+.btn-capture { flex: 1; padding: 9px; background: #722ed1; color: #fff;
+               border: none; border-radius: 6px; cursor: pointer; font-size: 14px; font-weight: 600; }
+.btn-capture:hover:not(:disabled) { background: #9254de; }
+.btn-capture:disabled { background: #d3adf7; cursor: not-allowed; }
+
+/* ── 上传图片面板 ── */
+.upload-area { flex: 1; display: flex; flex-direction: column; align-items: center;
+               justify-content: center; background: #fff; border-radius: 8px;
+               border: 2px dashed #d9d9d9; cursor: pointer; transition: border-color .2s;
+               position: relative; overflow: hidden; }
+.upload-area:hover { border-color: #1890ff; }
+.upload-area.dragover { border-color: #1890ff; background: #e6f7ff; }
+.upload-area input[type=file] { position: absolute; inset: 0; opacity: 0; cursor: pointer; }
+.upload-hint { text-align: center; pointer-events: none; }
+.upload-hint .icon { font-size: 48px; margin-bottom: 12px; }
+.upload-hint p { color: #666; font-size: 14px; }
+.upload-hint small { color: #bbb; font-size: 12px; }
+
+.preview-wrap { flex: 1; background: #fff; border-radius: 8px; overflow: hidden;
+                display: none; position: relative; }
+.preview-wrap img { max-width: 100%; max-height: 100%; object-fit: contain; display: block; }
+.preview-clear { position: absolute; top: 8px; right: 8px; background: rgba(0,0,0,.5);
+                 color: #fff; border: none; border-radius: 50%; width: 28px; height: 28px;
+                 cursor: pointer; font-size: 16px; display: flex; align-items: center;
+                 justify-content: center; }
+.btn-search-img { padding: 10px; background: #52c41a; color: #fff; border: none;
+                  border-radius: 6px; cursor: pointer; font-size: 14px; font-weight: 600; }
+.btn-search-img:hover:not(:disabled) { background: #73d13d; }
+.btn-search-img:disabled { background: #b7eb8f; cursor: not-allowed; }
+
+/* ── 右侧 ── */
+.right { flex: 1; display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+.result-card { background: #fff; border-radius: 8px; padding: 14px; flex: 1; overflow-y: auto; }
+.result-card h2 { font-size: 14px; font-weight: 600; margin-bottom: 10px;
+                  padding-bottom: 8px; border-bottom: 1px solid #f0f0f0; }
+.placeholder { color: #bbb; text-align: center; padding: 32px 0;
+               font-size: 13px; line-height: 1.9; }
+.result-item { display: flex; align-items: center; gap: 10px; padding: 8px;
+               border-radius: 6px; cursor: pointer; border: 2px solid transparent;
+               margin-bottom: 4px; transition: background .12s; }
+.result-item:hover { background: #f5f5f5; }
+.result-item.selected { border-color: #1890ff; background: #e6f7ff; }
+.rank { width: 20px; height: 20px; border-radius: 50%; display: flex;
+        align-items: center; justify-content: center; font-size: 11px;
+        font-weight: 700; flex-shrink: 0; background: #f0f0f0; color: #666; }
+.rank.r1 { background: #ffd700; color: #7c5800; }
+.rank.r2 { background: #c0c0c0; color: #555; }
+.rank.r3 { background: #cd7f32; color: #fff; }
+.item-thumb { width: 56px; height: 56px; border-radius: 6px; object-fit: contain;
+              background: #fafafa; border: 1px solid #f0f0f0; flex-shrink: 0; }
+.item-thumb-placeholder { width: 56px; height: 56px; border-radius: 6px;
+                           background: #f5f5f5; flex-shrink: 0; }
+.item-info { flex: 1; min-width: 0; }
+.item-name { font-size: 13px; font-weight: 500; overflow: hidden;
+             text-overflow: ellipsis; white-space: nowrap; }
+.bar-row { display: flex; align-items: center; gap: 6px; margin-top: 4px; }
+.bar { flex: 1; height: 5px; background: #f0f0f0; border-radius: 3px; overflow: hidden; }
+.bar-fill { height: 100%; background: #1890ff; border-radius: 3px; transition: width .4s; }
+.pct { font-size: 11px; color: #888; min-width: 34px; text-align: right; }
+.pct.hi { color: #52c41a; font-weight: 600; }
+
+.status { background: #fff; border-radius: 8px; padding: 9px 14px;
+          font-size: 12px; color: #888; }
+.status.loading { color: #1890ff; }
+.status.error   { color: #ff4d4f; }
+.status.ok      { color: #52c41a; }
+
+.btn-confirm { width: 100%; padding: 11px; background: #1890ff; color: #fff;
+               border: none; border-radius: 6px; cursor: pointer;
+               font-size: 14px; font-weight: 600; }
+.btn-confirm:hover:not(:disabled) { background: #40a9ff; }
+.btn-confirm:disabled { background: #bae7ff; cursor: not-allowed; }
+
+/* 框选弹窗 */
+.modal-mask { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.7);
+              z-index: 100; align-items: center; justify-content: center; }
+.modal-mask.show { display: flex; }
+.modal { background: #1a1a1a; border-radius: 10px; padding: 16px;
+         max-width: 90vw; max-height: 90vh; display: flex; flex-direction: column; gap: 10px; }
+.modal-top { color: #fff; font-size: 14px; display: flex; justify-content: space-between; align-items: center; }
+.modal-top small { color: #aaa; }
+canvas { display: block; border-radius: 4px; cursor: crosshair; user-select: none; }
+.modal-btns { display: flex; gap: 8px; }
+.modal-btns button { flex: 1; padding: 9px; border: none; border-radius: 6px;
+                     cursor: pointer; font-size: 14px; font-weight: 600; }
+.btn-cancel-sel { background: #333; color: #aaa; }
+.btn-reset-sel  { background: #444; color: #ccc; }
+.btn-do-search  { background: #52c41a; color: #fff; }
+.btn-do-search:hover { background: #73d13d; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>🎯 商品识别</h1>
+</div>
+
+<!-- 标签页 -->
+<div class="tabs">
+  <div class="tab active" onclick="switchTab('video')">📹 视频识别</div>
+  <div class="tab" onclick="switchTab('image')">🖼️ 上传图片</div>
+</div>
+
+<div class="layout">
+  <div class="left">
+
+    <!-- 视频面板 -->
+    <div class="panel active" id="panelVideo">
+      <div class="url-bar">
+        <input id="urlInput" type="text" placeholder="粘贴视频 URL（OSS 链接）..." />
+        <button onclick="loadVideo()">加载</button>
+      </div>
+      <div class="video-wrap">
+        <video id="video" controls preload="metadata"></video>
+        <div id="videoPlaceholder">请先输入视频 URL</div>
+      </div>
+      <div class="controls">
+        <div class="time-lbl">当前：<b id="currentTime">--</b></div>
+        <button class="btn-capture" id="btnCapture" onclick="captureFrame()" disabled>
+          截取当前帧并框选
+        </button>
+      </div>
+    </div>
+
+    <!-- 上传图片面板 -->
+    <div class="panel" id="panelImage">
+      <!-- 上传区（无预览时显示） -->
+      <div class="upload-area" id="uploadArea"
+           ondragover="onDragOver(event)" ondragleave="onDragLeave(event)" ondrop="onDrop(event)">
+        <input type="file" accept="image/*" id="fileInput" onchange="onFileSelect(event)" />
+        <div class="upload-hint">
+          <div class="icon">📂</div>
+          <p>点击或拖拽图片到此处</p>
+          <small>支持 JPG / PNG / WEBP</small>
+        </div>
+      </div>
+      <!-- 预览区（有图片时显示） -->
+      <div class="preview-wrap" id="previewWrap">
+        <img id="previewImg" src="" alt="预览" />
+        <button class="preview-clear" onclick="clearImage()" title="重新选择">✕</button>
+      </div>
+      <button class="btn-search-img" id="btnSearchImg" onclick="searchImage()" disabled>
+        识别图片
+      </button>
+    </div>
+
+  </div>
+
+  <!-- 右侧结果 -->
+  <div class="right">
+    <!-- 裁剪预览 -->
+    <div id="croppedBox" style="display:none;background:#fff;border-radius:8px;
+         padding:10px 14px;display:none;align-items:center;gap:12px">
+      <span style="font-size:12px;color:#888;white-space:nowrap">AI看到的图：</span>
+      <img id="croppedImg" src="" style="max-height:80px;max-width:160px;
+           border-radius:4px;border:1px solid #f0f0f0;object-fit:contain" />
+    </div>
+    <div class="result-card">
+      <h2>识别结果</h2>
+      <div id="results">
+        <div class="placeholder" id="defaultHint">
+          视频模式：暂停到清晰帧 → 截取 → 框选商品 → 识别<br><br>
+          图片模式：上传商品图片 → 识别
+        </div>
+      </div>
+    </div>
+    <div id="statusBar" class="status">待机</div>
+    <button class="btn-confirm" id="btnConfirm" disabled onclick="doConfirm()">
+      确认选择
+    </button>
+  </div>
+</div>
+
+<!-- 框选弹窗 -->
+<div class="modal-mask" id="modalMask">
+  <div class="modal">
+    <div class="modal-top">
+      <span>拖动鼠标框选商品区域</span>
+      <small id="selInfo">未选择</small>
+    </div>
+    <canvas id="frameCanvas"></canvas>
+    <div class="modal-btns">
+      <button class="btn-cancel-sel" onclick="closeModal()">取消</button>
+      <button class="btn-reset-sel"  onclick="resetSel()">重新框选</button>
+      <button class="btn-do-search"  id="btnDoSearch" onclick="doSearch()" disabled>识别框选区域</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const API = 'http://localhost:5001'
+
+let videoUrl   = ''
+let capturedTs = 0
+let frameW = 0, frameH = 0
+let canvasW = 0, canvasH = 0
+let selBox = null, dragging = false, dragStart = null
+let selectedName = ''
+let frameImg = null
+let uploadedFile = null
+
+const video  = document.getElementById('video')
+const canvas = document.getElementById('frameCanvas')
+const ctx    = canvas.getContext('2d')
+
+// ── 标签切换 ───────────────────────────────────────────────
+function switchTab(name) {
+  document.querySelectorAll('.tab').forEach((t, i) => {
+    t.classList.toggle('active', ['video','image'][i] === name)
+  })
+  document.getElementById('panelVideo').classList.toggle('active', name === 'video')
+  document.getElementById('panelImage').classList.toggle('active', name === 'image')
+}
+
+// ── 视频功能 ───────────────────────────────────────────────
+video.addEventListener('timeupdate', () => {
+  document.getElementById('currentTime').textContent = video.currentTime.toFixed(2) + 's'
+})
+video.addEventListener('loadedmetadata', () => {
+  document.getElementById('btnCapture').disabled = false
+  document.getElementById('videoPlaceholder').style.display = 'none'
+  video.style.display = 'block'
+  setStatus('视频已加载，时长 ' + video.duration.toFixed(1) + 's', 'ok')
+})
+video.addEventListener('error', () => setStatus('视频加载失败', 'error'))
+
+function loadVideo() {
+  videoUrl = document.getElementById('urlInput').value.trim()
+  if (!videoUrl) return
+  video.src = videoUrl
+  video.load()
+  setStatus('加载中...', 'loading')
+}
+
+async function captureFrame() {
+  video.pause()
+  capturedTs = video.currentTime
+  setStatus('截取帧中...', 'loading')
+  document.getElementById('btnCapture').disabled = true
+  try {
+    const res  = await fetch(API + '/capture/frame', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({url: videoUrl, timestamp: capturedTs})
+    })
+    const data = await res.json()
+    if (data.error) { setStatus('截帧失败：' + data.error, 'error'); return }
+    frameW = data.width; frameH = data.height
+    openModal('data:image/jpeg;base64,' + data.image)
+    setStatus('请框选商品区域', 'ok')
+  } catch(e) {
+    setStatus('请求失败：' + e.message, 'error')
+  } finally {
+    document.getElementById('btnCapture').disabled = false
+  }
+}
+
+// ── 上传图片功能 ────────────────────────────────────────────
+function onDragOver(e) {
+  e.preventDefault()
+  document.getElementById('uploadArea').classList.add('dragover')
+}
+function onDragLeave() {
+  document.getElementById('uploadArea').classList.remove('dragover')
+}
+function onDrop(e) {
+  e.preventDefault()
+  document.getElementById('uploadArea').classList.remove('dragover')
+  const file = e.dataTransfer.files[0]
+  if (file && file.type.startsWith('image/')) setUploadFile(file)
+}
+function onFileSelect(e) {
+  const file = e.target.files[0]
+  if (file) setUploadFile(file)
+}
+function setUploadFile(file) {
+  uploadedFile = file
+  const reader = new FileReader()
+  reader.onload = e => {
+    document.getElementById('previewImg').src = e.target.result
+    document.getElementById('uploadArea').style.display  = 'none'
+    document.getElementById('previewWrap').style.display = 'block'
+    document.getElementById('btnSearchImg').disabled = false
+    setStatus('图片已加载，点击「识别图片」', 'ok')
+  }
+  reader.readAsDataURL(file)
+}
+function clearImage() {
+  uploadedFile = null
+  document.getElementById('previewImg').src = ''
+  document.getElementById('uploadArea').style.display  = 'block'
+  document.getElementById('previewWrap').style.display = 'none'
+  document.getElementById('btnSearchImg').disabled = true
+  document.getElementById('fileInput').value = ''
+  setStatus('待机')
+}
+
+async function searchImage() {
+  if (!uploadedFile) return
+  setStatus('CLIP 召回中...', 'loading')
+  document.getElementById('btnSearchImg').disabled = true
+  try {
+    const form = new FormData()
+    form.append('image', uploadedFile)
+    const res  = await fetch(API + '/search/image', { method: 'POST', body: form })
+    const data = await res.json()
+    if (data.error) { setStatus('识别失败：' + data.error, 'error'); return }
+    showCroppedImg(data.cropped_img)
+    renderResults(data.results, data.vl_answer)
+    const msg = data.vl_answer ? `AI识别完成：${data.vl_answer}` : 'CLIP识别完成（VL不可用）'
+    setStatus(msg, 'ok')
+  } catch(e) {
+    setStatus('请求失败：' + e.message, 'error')
+  } finally {
+    document.getElementById('btnSearchImg').disabled = false
+  }
+}
+
+// ── 框选弹窗 ───────────────────────────────────────────────
+function openModal(src) {
+  frameImg = new Image()
+  frameImg.onload = () => {
+    const maxW = window.innerWidth * .82, maxH = window.innerHeight * .68
+    const scale = Math.min(maxW / frameW, maxH / frameH, 1)
+    canvasW = Math.round(frameW * scale); canvasH = Math.round(frameH * scale)
+    canvas.width = canvasW; canvas.height = canvasH
+    selBox = null
+    document.getElementById('btnDoSearch').disabled = true
+    document.getElementById('selInfo').textContent = '未选择'
+    drawCanvas()
+    document.getElementById('modalMask').classList.add('show')
+  }
+  frameImg.src = src
+}
+function closeModal() { document.getElementById('modalMask').classList.remove('show') }
+function resetSel() {
+  selBox = null
+  document.getElementById('btnDoSearch').disabled = true
+  document.getElementById('selInfo').textContent = '未选择'
+  drawCanvas()
+}
+function drawCanvas() {
+  ctx.clearRect(0, 0, canvasW, canvasH)
+  if (frameImg) ctx.drawImage(frameImg, 0, 0, canvasW, canvasH)
+  if (!selBox) return
+  ctx.save()
+  ctx.fillStyle = 'rgba(0,0,0,.45)'
+  ctx.fillRect(0, 0, canvasW, canvasH)
+  ctx.clearRect(selBox.x, selBox.y, selBox.w, selBox.h)
+  ctx.drawImage(frameImg,
+    selBox.x/canvasW*frameW, selBox.y/canvasH*frameH,
+    selBox.w/canvasW*frameW, selBox.h/canvasH*frameH,
+    selBox.x, selBox.y, selBox.w, selBox.h)
+  ctx.strokeStyle = '#52c41a'; ctx.lineWidth = 2
+  ctx.strokeRect(selBox.x, selBox.y, selBox.w, selBox.h)
+  ctx.restore()
+}
+canvas.addEventListener('mousedown', e => {
+  const r = canvas.getBoundingClientRect()
+  dragStart = {x: e.clientX-r.left, y: e.clientY-r.top}; dragging = true
+})
+canvas.addEventListener('mousemove', e => {
+  if (!dragging) return
+  const r = canvas.getBoundingClientRect()
+  const cx = e.clientX-r.left, cy = e.clientY-r.top
+  selBox = {x:Math.min(dragStart.x,cx), y:Math.min(dragStart.y,cy),
+            w:Math.abs(cx-dragStart.x), h:Math.abs(cy-dragStart.y)}
+  drawCanvas()
+})
+canvas.addEventListener('mouseup', () => {
+  dragging = false
+  if (selBox && selBox.w > 10 && selBox.h > 10) {
+    document.getElementById('selInfo').textContent =
+      `已框选 ${Math.round(selBox.w/canvasW*100)}% × ${Math.round(selBox.h/canvasH*100)}%`
+    document.getElementById('btnDoSearch').disabled = false
+  } else { selBox = null; drawCanvas() }
+})
+
+async function doSearch() {
+  if (!selBox) return
+  const crop = {x:selBox.x/canvasW, y:selBox.y/canvasH,
+                w:selBox.w/canvasW, h:selBox.h/canvasH}
+  document.getElementById('btnDoSearch').disabled = true
+  setStatus('识别中...', 'loading')
+  try {
+    const res  = await fetch(API + '/search/crop', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({url: videoUrl, timestamp: capturedTs, crop})
+    })
+    const data = await res.json()
+    if (data.error) { setStatus('识别失败：' + data.error, 'error'); return }
+    closeModal()
+    renderResults(data.results)
+    setStatus('识别完成（' + capturedTs.toFixed(2) + 's）', 'ok')
+  } catch(e) {
+    setStatus('请求失败：' + e.message, 'error')
+  } finally {
+    document.getElementById('btnDoSearch').disabled = false
+  }
+}
+
+// ── 结果渲染（视频和图片共用）─────────────────────────────────
+function renderResults(results, vlAnswer) {
+  selectedName = ''
+  document.getElementById('btnConfirm').disabled = true
+  if (!results || results.length === 0) {
+    document.getElementById('results').innerHTML = '<div class="placeholder">未找到匹配商品</div>'
+    return
+  }
+
+  // Qwen-VL 识别结果横幅
+  let vlHtml = ''
+  if (vlAnswer) {
+    vlHtml = `<div style="background:#f6ffed;border:1px solid #52c41a;border-radius:6px;
+      padding:8px 12px;font-size:13px;color:#237804;margin-bottom:8px;font-weight:600">
+      AI识别：${esc(vlAnswer)}</div>`
+  }
+
+  // 警告提示（橙色，纯 CLIP 模式才会出现）
+  let warnHtml = ''
+  if (results[0] && results[0].__warn__) {
+    warnHtml = `<div style="background:#fff7e6;border:1px solid #ffd591;border-radius:6px;
+      padding:8px 10px;font-size:12px;color:#d46b08;margin-bottom:8px">
+      ⚠️ ${esc(results[0].__warn__)}<br>
+      <span style="color:#888">建议换一张更清晰的图片或重新框选</span></div>`
+    results = results.slice(1)
+  }
+
+  const ranks = ['r1','r2','r3']
+  document.getElementById('results').innerHTML = vlHtml + warnHtml + results.map((r, i) => {
+    const pct   = Math.round(r.score * 100)
+    const thumb = r.img
+      ? `<img class="item-thumb" src="${esc(r.img)}" alt="" loading="lazy" />`
+      : `<div class="item-thumb-placeholder"></div>`
+    // VL 选中的显示 AI 标记
+    const aiBadge = r.vl_match
+      ? `<span style="font-size:10px;background:#52c41a;color:#fff;border-radius:3px;
+           padding:1px 5px;margin-left:6px">AI</span>`
+      : ''
+    return `<div class="result-item" onclick="selectItem(this,'${esc(r.name)}')" data-name="${esc(r.name)}">
+      <div class="rank ${ranks[i]||''}">${i+1}</div>
+      ${thumb}
+      <div class="item-info">
+        <div class="item-name" title="${esc(r.name)}">${esc(r.name)}${aiBadge}</div>
+        <div class="bar-row">
+          <div class="bar"><div class="bar-fill" style="width:${Math.min(pct,100)}%"></div></div>
+          <span class="pct ${pct>=75?'hi':''}">${pct}%</span>
+        </div>
+      </div>
+    </div>`
+  }).join('')
+}
+
+function selectItem(el, name) {
+  document.querySelectorAll('.result-item').forEach(e => e.classList.remove('selected'))
+  el.classList.add('selected')
+  selectedName = name
+  document.getElementById('btnConfirm').disabled = false
+}
+function doConfirm() {
+  if (!selectedName) return
+  alert('已确认：' + selectedName)
+}
+function showCroppedImg(src) {
+  const box = document.getElementById('croppedBox')
+  const img = document.getElementById('croppedImg')
+  if (src) { img.src = src; box.style.display = 'flex' }
+  else { box.style.display = 'none' }
+}
+
+function setStatus(msg, type) {
+  const b = document.getElementById('statusBar')
+  b.className = 'status ' + (type||'')
+  b.textContent = msg
+}
+function esc(s) {
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+          .replace(/"/g,'&quot;').replace(/'/g,'&#39;')
+}
+
+const p = new URLSearchParams(location.search)
+if (p.get('url')) { document.getElementById('urlInput').value = p.get('url'); loadVideo() }
+</script>
+</body>
+</html>

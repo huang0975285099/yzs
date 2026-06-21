@@ -1,0 +1,48 @@
+services:
+  redis:
+    image: redis:7.2
+    container_name: yzs-redis
+    restart: always
+    ports:
+      - "6379:6379"
+    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: yzs-backend
+    restart: always
+    environment:
+      DB_HOST: ${DB_HOST:-host.docker.internal}
+      DB_PORT: ${DB_PORT:-3306}
+      DB_USER: ${DB_USER:-root}
+      DB_PASSWORD: ${DB_PASSWORD:-123@123qwe}
+      DB_NAME: ${DB_NAME:-go_yzs}
+      JWT_SECRET: ${JWT_SECRET:-go-yzs-secret-key-2026}
+      SERVER_PORT: 18881
+      REDIS_HOST: yzs-redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+    ports:
+      - "18881:18881"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      - redis
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: yzs-frontend
+    restart: always
+    ports:
+      - "18880:18880"
+    depends_on:
+      - backend
+
+volumes:
+  redis_data:
