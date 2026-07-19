@@ -340,8 +340,15 @@ import { formatTime, goodsSummary, formatVideoDuration } from "../utils/format.j
 const $q = useQuasar();
 const router = useRouter();
 
+function formatLocalDate(d) {
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, "0");
+    const day = String(d.getDate()).padStart(2, "0");
+    return `${y}-${m}-${day}`;
+}
+
 // ─── Personal inspect stats ───
-const selectedDate = ref(new Date().toISOString().slice(0, 10));
+const selectedDate = ref(formatLocalDate(new Date()));
 const todayStats = reactive({ normalCount: 0, abnormalCount: 0, total: 0 });
 const historyStats = ref([]);
 
@@ -410,6 +417,13 @@ const qPagination = ref({ page: 1, rowsPerPage: 20, rowsNumber: 0 });
 
 const FILTER_KEY = "quality-review-filter";
 
+function getDefaultDateRange() {
+    const end = new Date();
+    const start = new Date();
+    start.setDate(start.getDate() - 2);
+    return { startDate: formatLocalDate(start), endDate: formatLocalDate(end) };
+}
+
 function loadStoredFilter() {
     try {
         const s = localStorage.getItem(FILTER_KEY);
@@ -420,10 +434,11 @@ function loadStoredFilter() {
 }
 
 const _stored = loadStoredFilter();
+const _defaultDates = getDefaultDateRange();
 const filter = reactive({
     userId: _stored.userId ?? null,
-    startDate: _stored.startDate ?? "",
-    endDate: _stored.endDate ?? "",
+    startDate: _stored.startDate ?? _defaultDates.startDate,
+    endDate: _stored.endDate ?? _defaultDates.endDate,
     actionType: _stored.actionType ?? null,
     inspectStatus: _stored.inspectStatus ?? null,
 });
@@ -538,9 +553,10 @@ function onFilterChange() {
 }
 
 function resetFilter() {
+    const dates = getDefaultDateRange();
     filter.userId = null;
-    filter.startDate = "";
-    filter.endDate = "";
+    filter.startDate = dates.startDate;
+    filter.endDate = dates.endDate;
     filter.actionType = null;
     filter.inspectStatus = null;
     localStorage.removeItem(FILTER_KEY);

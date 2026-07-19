@@ -46,6 +46,11 @@ export const userApi = {
   delete: (id) => http.delete(`/users/${id}`)
 }
 
+export const loginLogApi = {
+  // 查询登录日志，支持 userId / username / ip / status / page / pageSize
+  list: (params) => http.get('/login-logs', { params })
+}
+
 export const teamApi = {
   list: () => http.get('/teams'),
   create: (data) => http.post('/teams', data),

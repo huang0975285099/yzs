@@ -37,6 +37,9 @@ func Setup(r *gin.Engine) {
 		auth.GET("/me/handled-goods", handlers.ListMyHandledGoods)
 		auth.POST("/me/password", handlers.ChangePassword)
 
+		// Login logs（管理员可查看全部，普通用户仅看自己）
+		auth.GET("/login-logs", handlers.ListLoginLogs)
+
 		// Trade abnormal data
 		auth.GET("/trades", handlers.ListTradeAbnormal)
 		auth.GET("/trades/hourly-stats", handlers.GetHourlyStats)

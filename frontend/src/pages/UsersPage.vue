@@ -54,6 +54,15 @@
                         unelevated
                         @click="openCreateDialog"
                     />
+                    <q-btn
+                        v-if="authStore.user?.role === 'admin'"
+                        color="secondary"
+                        icon="history"
+                        label="登录日志"
+                        outline
+                        unelevated
+                        @click="openAllLoginLogs"
+                    />
                 </div>
 
                 <div class="table-scroll">
@@ -92,6 +101,14 @@
                                     color="primary"
                                     label="编辑"
                                     @click="openEditDialog(props.row)"
+                                />
+                                <q-btn
+                                    v-if="authStore.user?.role === 'admin'"
+                                    unelevated
+                                    size="sm"
+                                    color="info"
+                                    label="登录历史"
+                                    @click="openUserLoginLogs(props.row)"
                                 />
                                 <q-btn
                                     unelevated
@@ -204,13 +221,119 @@
                 </q-card-actions>
             </q-card>
         </q-dialog>
+
+        <!-- Login Logs Dialog -->
+        <q-dialog v-model="logDialogVisible" persistent>
+            <q-card style="min-width: 800px; max-width: 95vw; width: 100%">
+                <q-card-section class="row items-center q-pb-none">
+                    <div class="text-h6">
+                        登录日志{{ logFilterTitle }}
+                    </div>
+                    <q-space />
+                    <q-btn icon="close" flat round dense v-close-popup />
+                </q-card-section>
+
+                <q-card-section class="row q-gutter-md">
+                    <q-input
+                        v-model="logFilter.username"
+                        dense
+                        outlined
+                        label="用户名"
+                        style="min-width: 160px"
+                        :disable="!!logFilter.userId"
+                        @keyup.enter="reloadLoginLogs"
+                    />
+                    <q-input
+                        v-model="logFilter.ip"
+                        dense
+                        outlined
+                        label="IP地址"
+                        style="min-width: 160px"
+                        @keyup.enter="reloadLoginLogs"
+                    />
+                    <q-select
+                        v-model="logFilter.status"
+                        dense
+                        outlined
+                        label="状态"
+                        :options="logStatusOptions"
+                        emit-value
+                        map-options
+                        clearable
+                        style="min-width: 140px"
+                    />
+                    <q-btn
+                        color="primary"
+                        label="查询"
+                        unelevated
+                        @click="reloadLoginLogs"
+                    />
+                    <q-btn
+                        flat
+                        label="重置"
+                        @click="resetLogFilter"
+                    />
+                </q-card-section>
+
+                <q-card-section>
+                    <q-table
+                        :rows="loginLogs"
+                        :columns="logColumns"
+                        :loading="logLoading"
+                        :pagination="logPagination"
+                        :rows-per-page-options="[10, 20, 50]"
+                        row-key="id"
+                        flat
+                        bordered
+                        separator="cell"
+                        @request="onLogPageChange"
+                    >
+                        <template #body-cell-status="props">
+                            <q-td :props="props">
+                                <q-chip
+                                    dense
+                                    :color="
+                                        props.row.status === 'success'
+                                            ? 'positive'
+                                            : 'negative'
+                                    "
+                                    text-color="white"
+                                    class="q-ma-none"
+                                >
+                                    {{
+                                        props.row.status === "success"
+                                            ? "成功"
+                                            : "失败"
+                                    }}
+                                </q-chip>
+                            </q-td>
+                        </template>
+                        <template #body-cell-loginAt="props">
+                            <q-td :props="props">{{
+                                formatTime(props.row.loginAt)
+                            }}</q-td>
+                        </template>
+                        <template #body-cell-ua="props">
+                            <q-td :props="props" class="ua-cell">
+                                <q-tooltip>{{ props.row.ua }}</q-tooltip>
+                                {{ truncateUA(props.row.ua) }}
+                            </q-td>
+                        </template>
+                    </q-table>
+                </q-card-section>
+
+                <q-card-actions align="right" class="q-pa-md">
+                    <q-btn flat label="关闭" v-close-popup />
+                </q-card-actions>
+            </q-card>
+        </q-dialog>
     </q-page>
 </template>
 
 <script setup>
 import { ref, computed, onMounted } from "vue";
 import { useQuasar } from "quasar";
-import { userApi, teamApi } from "../api";
+import { userApi, teamApi, loginLogApi } from "../api";
 import { useAuthStore } from "../stores/auth";
 
 const $q = useQuasar();
@@ -272,7 +395,7 @@ const columns = [
         label: "操作",
         field: "actions",
         align: "center",
-        style: "width: 140px",
+        style: "width: 240px",
     },
 ];
 
@@ -439,4 +562,131 @@ function formatTime(t) {
     if (!t) return "-";
     return new Date(t).toLocaleString("zh-CN");
 }
+
+// ============ 登录日志 ============
+const logDialogVisible = ref(false);
+const logLoading = ref(false);
+const loginLogs = ref([]);
+const logFilter = ref({
+    userId: null,
+    username: "",
+    ip: "",
+    status: null,
+});
+const logPagination = ref({
+    page: 1,
+    rowsPerPage: 20,
+    rowsNumber: 0,
+});
+
+const logStatusOptions = [
+    { label: "成功", value: "success" },
+    { label: "失败", value: "failed" },
+];
+
+const logColumns = [
+    { name: "id", label: "ID", field: "id", align: "center", style: "width: 70px" },
+    { name: "username", label: "用户名", field: "username", align: "left" },
+    { name: "ip", label: "IP地址", field: "ip", align: "left", style: "width: 160px" },
+    { name: "status", label: "状态", field: "status", align: "center", style: "width: 90px" },
+    { name: "message", label: "说明", field: "message", align: "left", style: "width: 150px" },
+    { name: "loginAt", label: "登录时间", field: "loginAt", align: "left", style: "width: 180px" },
+    { name: "ua", label: "User-Agent", field: "ua", align: "left" },
+];
+
+const logFilterTitle = computed(() => {
+    if (!logFilter.value.userId) return "（全部）";
+    const u = users.value.find((x) => x.id === logFilter.value.userId);
+    return ` - ${u?.realname || u?.username || ""}`;
+});
+
+function openUserLoginLogs(user) {
+    // 仅按 userId 过滤，避免与 username 模糊匹配产生冲突
+    // （用户改名后旧日志的 username 与新 username 不一致会被 LIKE 过滤掉）
+    logFilter.value = {
+        userId: user.id,
+        username: "",
+        ip: "",
+        status: null,
+    };
+    logPagination.value = { page: 1, rowsPerPage: 20, rowsNumber: 0 };
+    logDialogVisible.value = true;
+    loadLoginLogs();
+}
+
+function openAllLoginLogs() {
+    logFilter.value = {
+        userId: null,
+        username: "",
+        ip: "",
+        status: null,
+    };
+    logPagination.value = { page: 1, rowsPerPage: 20, rowsNumber: 0 };
+    logDialogVisible.value = true;
+    loadLoginLogs();
+}
+
+function reloadLoginLogs() {
+    logPagination.value.page = 1;
+    loadLoginLogs();
+}
+
+function resetLogFilter() {
+    const keepUserId = logFilter.value.userId;
+    logFilter.value = {
+        userId: keepUserId,
+        username: keepUserId ? logFilter.value.username : "",
+        ip: "",
+        status: null,
+    };
+    logPagination.value.page = 1;
+    loadLoginLogs();
+}
+
+async function loadLoginLogs() {
+    logLoading.value = true;
+    try {
+        const params = {
+            page: logPagination.value.page,
+            pageSize: logPagination.value.rowsPerPage,
+        };
+        if (logFilter.value.userId) params.userId = logFilter.value.userId;
+        if (logFilter.value.username) params.username = logFilter.value.username;
+        if (logFilter.value.ip) params.ip = logFilter.value.ip;
+        if (logFilter.value.status) params.status = logFilter.value.status;
+        const res = await loginLogApi.list(params);
+        const data = res.data || {};
+        loginLogs.value = data.list || [];
+        logPagination.value.rowsNumber = data.total || 0;
+    } catch (err) {
+        $q.notify({
+            type: "negative",
+            message: err?.message || "获取登录日志失败",
+        });
+        loginLogs.value = [];
+        logPagination.value.rowsNumber = 0;
+    } finally {
+        logLoading.value = false;
+    }
+}
+
+function onLogPageChange(props) {
+    logPagination.value.page = props.pagination.page;
+    logPagination.value.rowsPerPage = props.pagination.rowsPerPage;
+    loadLoginLogs();
+}
+
+function truncateUA(ua) {
+    if (!ua) return "-";
+    return ua.length > 60 ? ua.slice(0, 60) + "…" : ua;
+}
 </script>
+
+<style scoped>
+.ua-cell {
+    max-width: 280px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+</style>

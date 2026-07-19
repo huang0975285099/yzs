@@ -6,8 +6,10 @@ import (
 	"go-yzs/database"
 	"go-yzs/middleware"
 	"go-yzs/models"
+	"log"
 	"net/http"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
@@ -19,6 +21,35 @@ type LoginRequest struct {
 	DeviceKey string `json:"deviceKey"`
 }
 
+// truncateRunes 按字符数截断字符串（避免中文字节截断产生乱码）
+func truncateRunes(s string, max int) string {
+	if utf8.RuneCountInString(s) <= max {
+		return s
+	}
+	runes := []rune(s)
+	return string(runes[:max])
+}
+
+// recordLoginLog 记录登录日志，错误时仅打印日志，不影响登录主流程
+func recordLoginLog(userID uint, username, ip, ua, status, message string, loginAt time.Time) {
+	// 按字符数截断超长字段，避免 MySQL 写入失败
+	// 注意：MySQL VARCHAR(50) 在 utf8mb4 下指 50 个字符，不是 50 字节
+	username = truncateRunes(username, 50)
+	ua = truncateRunes(ua, 500)
+	message = truncateRunes(message, 255)
+	if err := database.DB.Create(&models.LoginLog{
+		UserID:   userID,
+		Username: username,
+		IP:       ip,
+		UA:       ua,
+		Status:   status,
+		Message:  message,
+		LoginAt:  loginAt,
+	}).Error; err != nil {
+		log.Printf("[LoginLog] 写入失败: %v", err)
+	}
+}
+
 func Login(c *gin.Context) {
 	var req LoginRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -26,13 +57,21 @@ func Login(c *gin.Context) {
 		return
 	}
 
+	clientIP := c.ClientIP()
+	userAgent := c.Request.UserAgent()
+	now := time.Now()
+
 	var user models.User
 	if err := database.DB.Where("username = ?", req.Username).First(&user).Error; err != nil {
+		// 记录失败日志：用户不存在
+		recordLoginLog(0, req.Username, clientIP, userAgent, "failed", "用户不存在", now)
 		c.JSON(http.StatusUnauthorized, gin.H{"code": 401, "message": "用户名或密码错误"})
 		return
 	}
 
 	if !user.CheckPassword(req.Password) {
+		// 记录失败日志：密码错误
+		recordLoginLog(user.ID, user.Username, clientIP, userAgent, "failed", "密码错误", now)
 		c.JSON(http.StatusUnauthorized, gin.H{"code": 401, "message": "用户名或密码错误"})
 		return
 	}
@@ -50,6 +89,8 @@ func Login(c *gin.Context) {
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
 	tokenStr, err := token.SignedString([]byte(config.App.JWTSecret))
 	if err != nil {
+		// 记录失败日志：生成 Token 失败
+		recordLoginLog(user.ID, user.Username, clientIP, userAgent, "failed", "生成 Token 失败", now)
 		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "生成 Token 失败"})
 		return
 	}
@@ -78,6 +119,9 @@ func Login(c *gin.Context) {
 		Role:      user.Role,
 		ExpiredAt: expiredAt,
 	})
+
+	// 记录成功日志
+	recordLoginLog(user.ID, user.Username, clientIP, userAgent, "success", "登录成功", now)
 
 	c.JSON(http.StatusOK, gin.H{
 		"code":    200,

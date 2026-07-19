@@ -68,6 +68,7 @@ func Init() {
 		&models.TradeReview{},
 		&models.HandledGoods{},
 		&models.FavoriteGoods{},
+		&models.LoginLog{},
 	} {
 		if err = db.AutoMigrate(m); err != nil {
 			if strings.Contains(err.Error(), "1050") || strings.Contains(err.Error(), "already exists") {

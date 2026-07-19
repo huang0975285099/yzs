@@ -217,15 +217,31 @@ import { useQuasar } from "quasar";
 import { tradeApi } from "../api";
 
 const $q = useQuasar();
+
+function formatLocalDate(d) {
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, "0");
+    const day = String(d.getDate()).padStart(2, "0");
+    return `${y}-${m}-${day}`;
+}
+
+function getDefaultDateRange() {
+    const end = new Date();
+    const start = new Date();
+    start.setDate(start.getDate() - 2);
+    return { startDate: formatLocalDate(start), endDate: formatLocalDate(end) };
+}
+
 const loading = ref(false);
 const records = ref([]);
 const lastSyncTime = ref("");
 
+const _defaultDates = getDefaultDateRange();
 const filter = reactive({
     keyword: "",
     isHandled: "",
-    startDate: new Date(Date.now() - 7 * 24 * 3600 * 1000).toISOString().slice(0, 10),
-    endDate: new Date().toISOString().slice(0, 10),
+    startDate: _defaultDates.startDate,
+    endDate: _defaultDates.endDate,
 });
 
 const qPagination = ref({ page: 1, rowsPerPage: 20, rowsNumber: 0 });
@@ -469,10 +485,11 @@ function handleSearch() {
 }
 
 function handleReset() {
+    const dates = getDefaultDateRange();
     filter.keyword = "";
     filter.isHandled = "";
-    filter.startDate = "";
-    filter.endDate = "";
+    filter.startDate = dates.startDate;
+    filter.endDate = dates.endDate;
     qPagination.value = { ...qPagination.value, page: 1 };
     fetchData();
     fetchHourlyStats();

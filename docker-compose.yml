@@ -26,6 +26,7 @@ services:
       REDIS_HOST: yzs-redis
       REDIS_PORT: 6379
       REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      TRUSTED_PROXIES: ${TRUSTED_PROXIES:-127.0.0.1,172.16.0.0/12,10.0.0.0/8,192.168.0.0/16}
     ports:
       - "18881:18881"
     extra_hosts:

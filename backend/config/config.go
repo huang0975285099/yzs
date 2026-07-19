@@ -14,6 +14,7 @@ type Config struct {
 	RedisHost     string
 	RedisPort     string
 	RedisPassword string
+	TrustedProxies string // 信任的代理IP列表（逗号分隔），用于正确解析 X-Forwarded-For
 }
 
 var App *Config
@@ -31,6 +32,7 @@ func Init() {
 		RedisHost:     getEnv("REDIS_HOST", "127.0.0.1"),
 		RedisPort:     getEnv("REDIS_PORT", "6379"),
 		RedisPassword: getEnv("REDIS_PASSWORD", ""),
+		TrustedProxies: getEnv("TRUSTED_PROXIES", ""), // 空字符串=不信任任何代理(直连模式)；"*"=信任所有；具体如 "127.0.0.1,10.0.0.0/8"
 	}
 }
 
