@@ -7,6 +7,7 @@ import (
 	"go-yzs/database"
 	"go-yzs/models"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -172,15 +173,15 @@ func PendTrade(c *gin.Context) {
 		}
 		now := time.Now()
 		database.DB.Model(&trade).Updates(map[string]any{
-			"review_status":    "pending",
-			"locked_by_id":     nil,
-			"locked_at":        nil,
-			"handled_by_id":    user.ID,
-			"handled_by_name":  handlerName,
-			"handled_at":       now,
-			"handle_duration":  pendReq.Duration,
-			"handle_remark":    pendReq.Remark,
-			"handle_source":    "internal",
+			"review_status":   "pending",
+			"locked_by_id":    nil,
+			"locked_at":       nil,
+			"handled_by_id":   user.ID,
+			"handled_by_name": handlerName,
+			"handled_at":      now,
+			"handle_duration": pendReq.Duration,
+			"handle_remark":   pendReq.Remark,
+			"handle_source":   "internal",
 		})
 		incrementDailyStats(user.ID, "pend")
 		c.JSON(http.StatusOK, gin.H{"code": 200, "message": "已提交质检审核"})
@@ -570,72 +571,110 @@ func ListMyHandled(c *gin.Context) {
 func GetStats(c *gin.Context) {
 	user := c.MustGet("user").(*models.User)
 
+	shanghaiLoc, _ := time.LoadLocation("Asia/Shanghai")
+	now := time.Now().In(shanghaiLoc)
+	todayStr := now.Format("2006-01-02")
+	thirtyDaysAgo := now.AddDate(0, 0, -30).Format("2006-01-02 00:00:00")
+	todayStart := todayStr + " 00:00:00"
+	todayEnd := todayStr + " 23:59:59"
+
+	// 并发执行所有独立查询
+	var wg sync.WaitGroup
+
+	// 1. 最近30天每日统计（create_time 是字符串，用 LEFT 提取日期避免 DATE() 全表扫描）
 	type DayCount struct {
 		Day   string `json:"day"`
 		Count int    `json:"count"`
 	}
 	var dailyCounts []DayCount
-	shanghaiLoc30, _ := time.LoadLocation("Asia/Shanghai")
-	thirtyDaysAgo := time.Now().In(shanghaiLoc30).AddDate(0, 0, -30).Format("2006-01-02 00:00:00")
-	database.DB.Raw(`
-		SELECT DATE(create_time) as day, COUNT(*) as count
-		FROM trade_abnormals
-		WHERE create_time >= ?
-		GROUP BY DATE(create_time)
-		ORDER BY day ASC
-	`, thirtyDaysAgo).Scan(&dailyCounts)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		database.DB.Raw(`
+			SELECT LEFT(create_time, 10) as day, COUNT(*) as count
+			FROM trade_abnormals
+			WHERE create_time >= ?
+			GROUP BY LEFT(create_time, 10)
+			ORDER BY day ASC
+		`, thirtyDaysAgo).Scan(&dailyCounts)
+	}()
 
+	// 2. 异常类型统计（限制最近30天，避免全表扫描）
 	type TypeCount struct {
 		Name  string `json:"name"`
 		Value int    `json:"value"`
 	}
 	var typeCounts []TypeCount
-	database.DB.Raw(`
-		SELECT abnormal_type_desc as name, COUNT(*) as value
-		FROM trade_abnormals
-		GROUP BY abnormal_type_desc
-		ORDER BY value DESC
-	`).Scan(&typeCounts)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		database.DB.Raw(`
+			SELECT abnormal_type_desc as name, COUNT(*) as value
+			FROM trade_abnormals
+			WHERE create_time >= ?
+			GROUP BY abnormal_type_desc
+			ORDER BY value DESC
+		`, thirtyDaysAgo).Scan(&typeCounts)
+	}()
 
-	var handledCount, unhandledCount int64
-	database.DB.Model(&models.TradeAbnormal{}).Where("is_handled = ?", true).Count(&handledCount)
-	database.DB.Model(&models.TradeAbnormal{}).Where("is_handled = ?", false).Count(&unhandledCount)
+	// 3. 合并 total / handledCount / unhandledCount 为单次查询
+	type CountResult struct {
+		Total      int64
+		Handled    int64
+		Unhandled  int64
+		TodayCount int64
+	}
+	var cr CountResult
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		database.DB.Raw(`
+			SELECT
+				COUNT(*) as total,
+				COALESCE(SUM(CASE WHEN is_handled = 1 THEN 1 ELSE 0 END), 0) as handled,
+				COALESCE(SUM(CASE WHEN is_handled = 0 THEN 1 ELSE 0 END), 0) as unhandled,
+				COALESCE(SUM(CASE WHEN create_time >= ? AND create_time <= ? THEN 1 ELSE 0 END), 0) as today_count
+			FROM trade_abnormals
+		`, todayStart, todayEnd).Scan(&cr)
+	}()
 
-	var total int64
-	database.DB.Model(&models.TradeAbnormal{}).Count(&total)
-
-	var todayCount int64
-	shanghaiLoc, _ := time.LoadLocation("Asia/Shanghai")
-	todayStr := time.Now().In(shanghaiLoc).Format("2006-01-02")
-	database.DB.Model(&models.TradeAbnormal{}).
-		Where("DATE(create_time) = ?", todayStr).Count(&todayCount)
-
-	// 待质检数量
+	// 4. 待质检数量
 	var pendingReviewCount int64
-	database.DB.Model(&models.TradeReview{}).Where("review_status = ?", "pending").Count(&pendingReviewCount)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		database.DB.Model(&models.TradeReview{}).Where("review_status = ?", "pending").Count(&pendingReviewCount)
+	}()
 
+	// 5. 操作员统计（限制最近30天）
 	type OpStat struct {
 		Name  string `json:"name"`
 		Value int    `json:"value"`
 	}
 	var opStats []OpStat
 	if user.Role == "admin" || user.Role == "statistician" {
-		database.DB.Raw(`
-			SELECT handled_by_name as name, COUNT(*) as value
-			FROM trade_abnormals
-			WHERE is_handled = true
-			GROUP BY handled_by_id, handled_by_name
-			ORDER BY value DESC
-		`).Scan(&opStats)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			database.DB.Raw(`
+				SELECT handled_by_name as name, COUNT(*) as value
+				FROM trade_abnormals
+				WHERE is_handled = 1 AND create_time >= ?
+				GROUP BY handled_by_id, handled_by_name
+				ORDER BY value DESC
+			`, thirtyDaysAgo).Scan(&opStats)
+		}()
 	}
+
+	wg.Wait()
 
 	c.JSON(http.StatusOK, gin.H{
 		"code": 200,
 		"data": gin.H{
-			"total":              total,
-			"todayCount":         todayCount,
-			"handledCount":       handledCount,
-			"unhandledCount":     unhandledCount,
+			"total":              cr.Total,
+			"todayCount":         cr.TodayCount,
+			"handledCount":       cr.Handled,
+			"unhandledCount":     cr.Unhandled,
 			"pendingReviewCount": pendingReviewCount,
 			"dailyCounts":        dailyCounts,
 			"typeCounts":         typeCounts,
