@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"gorm.io/gorm"
 )
 
 const externalBaseURL = "https://api.uboxol.com/lotus/trade/abnormal"
@@ -387,182 +386,58 @@ func HandleTrade(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"code": 200, "message": "处理成功", "data": trade})
 }
 
-type MyHandledRecord struct {
-	models.TradeAbnormal
-	ActionType string `json:"actionType"` // "submit" or "pend"
-}
-
 // ListMyHandled 查询当前操作员的已处理订单 + 待审核订单
 func ListMyHandled(c *gin.Context) {
 	user := c.MustGet("user").(*models.User)
-	page := c.DefaultQuery("page", "1")
-	size := c.DefaultQuery("size", "20")
+	page, size := 1, 20
+	parseIntParam(c.DefaultQuery("page", "1"), &page)
+	parseIntParam(c.DefaultQuery("size", "20"), &size)
+	if page < 1 {
+		page = 1
+	}
+	if size < 1 {
+		size = 20
+	}
 	date := c.Query("date")                   // 可选日期过滤，格式 YYYY-MM-DD
 	inspectStatus := c.Query("inspectStatus") // '' 全部, 'normal', 'abnormal', 'uninspected'
-
-	// 查询该用户待审核的 trade_reviews（含 action_type）
-	type pendingReview struct {
-		TradeID    uint
-		ActionType string
-	}
-	var pendingReviews []pendingReview
-	database.DB.Model(&models.TradeReview{}).
-		Select("trade_id, action_type").
-		Where("submitted_by_id = ? AND review_status = ?", user.ID, "pending").
-		Scan(&pendingReviews)
-
-	pendingTradeIDs := make([]uint, 0, len(pendingReviews))
-	pendingActionMap := make(map[uint]string, len(pendingReviews))
-	for _, r := range pendingReviews {
-		pendingTradeIDs = append(pendingTradeIDs, r.TradeID)
-		pendingActionMap[r.TradeID] = r.ActionType
-	}
-
-	// baseWhere 封装重复的主条件，避免两处拼写
-	baseWhere := func(q *gorm.DB) *gorm.DB {
-		if len(pendingTradeIDs) > 0 {
-			return q.Where(
-				"(is_handled = ? AND handled_by_id = ? AND handled_by_name != ?) OR (review_status = ? AND id IN ?)",
-				true, user.ID, "外部系统", "pending", pendingTradeIDs,
-			)
-		}
-		return q.Where("is_handled = ? AND handled_by_id = ? AND handled_by_name != ?", true, user.ID, "外部系统")
-	}
-
-	// applyDateFilter 用范围比较代替 DATE() 函数，使 handled_at 索引生效
-	applyDateFilter := func(q *gorm.DB) *gorm.DB {
-		if date == "" {
-			return q
-		}
-		loc, _ := time.LoadLocation("Asia/Shanghai")
-		startOfDay, err := time.ParseInLocation("2006-01-02", date, loc)
+	filter := operatorRecordFilter{UserIDs: []uint{user.ID}, InspectStatus: inspectStatus}
+	if date != "" {
+		start, err := parseShanghaiDate(date)
 		if err != nil {
-			return q
+			c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "日期格式错误"})
+			return
 		}
-		endOfDay := startOfDay.Add(24 * time.Hour)
-		return q.Where("handled_at >= ? AND handled_at < ?", startOfDay, endOfDay)
+		filter.StartTime = start.Format("2006-01-02 15:04:05")
+		filter.EndTimeExclusive = start.AddDate(0, 0, 1).Format("2006-01-02 15:04:05")
 	}
 
-	applyInspectFilter := func(q *gorm.DB) *gorm.DB {
-		switch inspectStatus {
-		case "normal", "abnormal":
-			return q.Where("inspect_status = ?", inspectStatus)
-		case "uninspected":
-			return q.Where("inspect_status = '' OR inspect_status IS NULL")
-		}
-		return q
+	records, total, err := queryOperatorRecords(filter, page, size)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "查询处理记录失败"})
+		return
 	}
-
-	var trades []models.TradeAbnormal
-	var total int64
-
-	query := applyInspectFilter(applyDateFilter(baseWhere(database.DB.Model(&models.TradeAbnormal{}))))
-	query.Count(&total)
-
-	var pageInt, sizeInt int
-	parseIntParam(page, &pageInt)
-	parseIntParam(size, &sizeInt)
-	if pageInt < 1 {
-		pageInt = 1
+	daySummary, err := queryOperatorRecordSummary(filter)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "查询当日统计失败"})
+		return
 	}
-	if sizeInt < 1 {
-		sizeInt = 20
+	cumulative, err := queryOperatorRecordSummary(operatorRecordFilter{UserIDs: []uint{user.ID}})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "查询累计统计失败"})
+		return
 	}
-
-	offset := (pageInt - 1) * sizeInt
-	query.Order("CASE WHEN review_status = 'pending' THEN 0 ELSE 1 END, handled_at DESC").
-		Offset(offset).Limit(sizeInt).Find(&trades)
-
-	// 组装 actionType
-	records := make([]MyHandledRecord, 0, len(trades))
-	for _, t := range trades {
-		actionType := "submit"
-		if t.ReviewStatus == "pending" {
-			if at, ok := pendingActionMap[t.ID]; ok {
-				actionType = at
-			}
-		} else {
-			if t.PendStatusDesc != "" && (t.PendStatusDesc == "已挂起" || t.PendStatusDesc == "PENDING") {
-				actionType = "pend"
-			}
-		}
-		records = append(records, MyHandledRecord{TradeAbnormal: t, ActionType: actionType})
-	}
-
-	// 当日总金额：用 JSON_TABLE 在 SQL 层直接 SUM，无需把 JSON 传回 Go 解析
-	var totalAmountResult struct {
-		TotalAmount float64 `gorm:"column:total_amount"`
-	}
-	{
-		// 构建与主查询相同的 WHERE 条件
-		amountSQL := `
-			SELECT COALESCE(SUM(jt.price * jt.cnt), 0) AS total_amount
-			FROM trade_abnormals t
-			CROSS JOIN JSON_TABLE(
-				t.handle_goods,
-				'$[*]' COLUMNS (price DOUBLE PATH '$.goodsPrice', cnt INT PATH '$.goodsCount')
-			) jt
-			WHERE t.handle_goods != '' AND t.handle_goods IS NOT NULL`
-		var amountArgs []interface{}
-		if len(pendingTradeIDs) > 0 {
-			amountSQL += " AND ((t.is_handled = ? AND t.handled_by_id = ? AND t.handled_by_name != ?) OR (t.review_status = ? AND t.id IN (?)))"
-			amountArgs = append(amountArgs, true, user.ID, "外部系统", "pending", pendingTradeIDs)
-		} else {
-			amountSQL += " AND t.is_handled = ? AND t.handled_by_id = ? AND t.handled_by_name != ?"
-			amountArgs = append(amountArgs, true, user.ID, "外部系统")
-		}
-		if date != "" {
-			loc, _ := time.LoadLocation("Asia/Shanghai")
-			startOfDay, err := time.ParseInLocation("2006-01-02", date, loc)
-			if err == nil {
-				amountArgs = append(amountArgs, startOfDay, startOfDay.Add(24*time.Hour))
-				amountSQL += " AND t.handled_at >= ? AND t.handled_at < ?"
-			}
-		}
-		database.DB.Raw(amountSQL, amountArgs...).Scan(&totalAmountResult)
-	}
-	totalAmount := totalAmountResult.TotalAmount
-
-	// ===== 累计统计（不按日期过滤）=====
-	// JSON_TABLE 子查询：每条 trade 先按 id 聚合出单条金额，外层再统计件数和总金额
-	// 三个原始查询（2×COUNT + 1×全量扫描）合并为一次 DB 往返
-	type cumulativeResult struct {
-		SubmitCount      int64   `gorm:"column:submit_count"`
-		PendCount        int64   `gorm:"column:pend_count"`
-		CumulativeAmount float64 `gorm:"column:cumulative_amount"`
-	}
-	var cumResult cumulativeResult
-	database.DB.Raw(`
-		SELECT
-			SUM(CASE WHEN (sub.pend_status_desc IS NULL OR sub.pend_status_desc = '' OR sub.pend_status_desc != '已挂起') THEN 1 ELSE 0 END) AS submit_count,
-			SUM(CASE WHEN sub.pend_status_desc = '已挂起'                                                                   THEN 1 ELSE 0 END) AS pend_count,
-			COALESCE(SUM(CASE WHEN (sub.pend_status_desc IS NULL OR sub.pend_status_desc = '' OR sub.pend_status_desc != '已挂起') THEN sub.trade_amount ELSE 0 END), 0) AS cumulative_amount
-		FROM (
-			SELECT
-				t.pend_status_desc,
-				COALESCE(SUM(jt.price * jt.cnt), 0) AS trade_amount
-			FROM trade_abnormals t
-			LEFT JOIN JSON_TABLE(
-				CASE WHEN t.handle_goods != '' AND t.handle_goods IS NOT NULL THEN t.handle_goods ELSE '[]' END,
-				'$[*]' COLUMNS (price DOUBLE PATH '$.goodsPrice', cnt INT PATH '$.goodsCount')
-			) jt ON TRUE
-			WHERE t.is_handled = true AND t.handled_by_id = ? AND t.handled_by_name != ?
-			GROUP BY t.id, t.pend_status_desc
-		) sub`,
-		user.ID, "外部系统",
-	).Scan(&cumResult)
 
 	c.JSON(http.StatusOK, gin.H{
 		"code": 200,
 		"data": gin.H{
 			"records":          records,
 			"total":            total,
-			"page":             pageInt,
-			"size":             sizeInt,
-			"totalAmount":      totalAmount,
-			"cumulativeSubmit": cumResult.SubmitCount,
-			"cumulativePend":   cumResult.PendCount,
-			"cumulativeAmount": cumResult.CumulativeAmount,
+			"page":             page,
+			"size":             size,
+			"totalAmount":      daySummary.Amount,
+			"cumulativeSubmit": cumulative.SubmitCount,
+			"cumulativePend":   cumulative.PendCount,
+			"cumulativeAmount": cumulative.Amount,
 		},
 	})
 }
@@ -646,7 +521,7 @@ func GetStats(c *gin.Context) {
 		database.DB.Model(&models.TradeReview{}).Where("review_status = ?", "pending").Count(&pendingReviewCount)
 	}()
 
-	// 5. 操作员统计（限制最近30天）
+	// 5. 操作员累计处理量排行（与操作员个人累计口径一致）
 	type OpStat struct {
 		Name  string `json:"name"`
 		Value int    `json:"value"`
@@ -656,13 +531,12 @@ func GetStats(c *gin.Context) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			database.DB.Raw(`
-				SELECT handled_by_name as name, COUNT(*) as value
-				FROM trade_abnormals
-				WHERE is_handled = 1 AND create_time >= ?
+			unionSQL, args := buildOperatorRecordUnion(operatorRecordFilter{})
+			database.DB.Raw(`SELECT handled_by_name AS name, COUNT(*) AS value
+				FROM (`+unionSQL+`) AS events
 				GROUP BY handled_by_id, handled_by_name
 				ORDER BY value DESC
-			`, thirtyDaysAgo).Scan(&opStats)
+			`, args...).Scan(&opStats)
 		}()
 	}
 

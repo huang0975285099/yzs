@@ -225,6 +225,21 @@ import { formatTimeLocale, goodsSummary, formatVideoDuration } from "../utils/fo
 const $q = useQuasar();
 const router = useRouter();
 
+function formatShanghaiDate(date) {
+    const values = Object.fromEntries(
+        new Intl.DateTimeFormat("en-US", {
+            timeZone: "Asia/Shanghai",
+            year: "numeric",
+            month: "2-digit",
+            day: "2-digit",
+        })
+            .formatToParts(date)
+            .filter((part) => part.type !== "literal")
+            .map((part) => [part.type, part.value]),
+    );
+    return `${values.year}-${values.month}-${values.day}`;
+}
+
 const loading = ref(false);
 const records = ref([]);
 const qPagination = ref({ page: 1, rowsPerPage: 20, rowsNumber: 0 });
@@ -233,7 +248,7 @@ const cumulativeSubmit = ref(0);
 const cumulativePend = ref(0);
 const cumulativeAmount = ref(0);
 
-const selectedDate = ref(new Date().toISOString().slice(0, 10));
+const selectedDate = ref(formatShanghaiDate(new Date()));
 const inspectStatusFilter = ref("");
 const inspectStatusOptions = [
     { label: "全部", value: "" },

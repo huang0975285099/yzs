@@ -96,6 +96,30 @@ func AdminRequired() gin.HandlerFunc {
 	}
 }
 
+// RolesRequired enforces authorization on the API itself instead of relying
+// on frontend route guards.
+func RolesRequired(roles ...string) gin.HandlerFunc {
+	allowed := make(map[string]struct{}, len(roles))
+	for _, role := range roles {
+		allowed[role] = struct{}{}
+	}
+	return func(c *gin.Context) {
+		value, ok := c.Get("user")
+		user, valid := value.(*models.User)
+		if !ok || !valid {
+			c.JSON(http.StatusUnauthorized, gin.H{"code": 401, "message": "未授权，请先登录"})
+			c.Abort()
+			return
+		}
+		if _, ok := allowed[user.Role]; !ok {
+			c.JSON(http.StatusForbidden, gin.H{"code": 403, "message": "无权查看统计数据"})
+			c.Abort()
+			return
+		}
+		c.Next()
+	}
+}
+
 func extractToken(c *gin.Context) string {
 	auth := c.GetHeader("Authorization")
 	if strings.HasPrefix(auth, "Bearer ") {

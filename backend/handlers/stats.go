@@ -16,17 +16,18 @@ func GetOperatorStats(c *gin.Context) {
 	shanghaiLoc, _ := time.LoadLocation("Asia/Shanghai")
 	today := time.Now().In(shanghaiLoc).Format("2006-01-02")
 
-	// 查询所有有处理记录的用户ID（从 trade_abnormals 表）
+	// 查询所有有处理事件的用户（审核中和已完成使用同一事实源）
 	type handlerInfo struct {
 		ID   uint
 		Name string
 	}
 	var handlers []handlerInfo
-	database.DB.Model(&models.TradeAbnormal{}).
-		Select("handled_by_id as id, MAX(handled_by_name) as name").
-		Where("is_handled = 1 AND handled_by_id IS NOT NULL AND handled_by_name != '外部系统' AND handled_by_name != ''").
-		Group("handled_by_id").
-		Scan(&handlers)
+	allEventsSQL, allEventsArgs := buildOperatorRecordUnion(operatorRecordFilter{})
+	if err := database.DB.Raw(`SELECT handled_by_id AS id, MAX(handled_by_name) AS name
+		FROM (`+allEventsSQL+`) AS events GROUP BY handled_by_id`, allEventsArgs...).Scan(&handlers).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "查询操作员失败"})
+		return
+	}
 
 	if len(handlers) == 0 {
 		c.JSON(http.StatusOK, gin.H{"code": 200, "data": []gin.H{}})
@@ -39,12 +40,35 @@ func GetOperatorStats(c *gin.Context) {
 		ids[i] = h.ID
 	}
 
-	// 今日统计
+	// 今日开始/跳过来自点击计数；提交/挂起来自统一操作事件源。
 	var todayStats []models.DailyStats
 	database.DB.Where("user_id IN ? AND date = ?", ids, today).Find(&todayStats)
 	todayMap := make(map[uint]*models.DailyStats, len(todayStats))
 	for i := range todayStats {
 		todayMap[todayStats[i].UserID] = &todayStats[i]
+	}
+	todayStart, _ := parseShanghaiDate(today)
+	todayFilter := operatorRecordFilter{
+		StartTime:        todayStart.Format("2006-01-02 15:04:05"),
+		EndTimeExclusive: todayStart.AddDate(0, 0, 1).Format("2006-01-02 15:04:05"),
+	}
+	todayEventsSQL, todayEventsArgs := buildOperatorRecordUnion(todayFilter)
+	type todayAction struct {
+		UserID      uint `gorm:"column:user_id"`
+		SubmitCount int  `gorm:"column:submit_count"`
+		PendCount   int  `gorm:"column:pend_count"`
+	}
+	var todayActions []todayAction
+	if err := database.DB.Raw(`SELECT handled_by_id AS user_id,
+		SUM(CASE WHEN action_type = 'submit' THEN 1 ELSE 0 END) AS submit_count,
+		SUM(CASE WHEN action_type = 'pend' THEN 1 ELSE 0 END) AS pend_count
+		FROM (`+todayEventsSQL+`) AS events GROUP BY handled_by_id`, todayEventsArgs...).Scan(&todayActions).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "查询今日统计失败"})
+		return
+	}
+	actionMap := make(map[uint]todayAction, len(todayActions))
+	for _, action := range todayActions {
+		actionMap[action.UserID] = action
 	}
 
 	// 查询用户信息补充 username 和 realname
@@ -59,13 +83,13 @@ func GetOperatorStats(c *gin.Context) {
 	result := make([]gin.H, 0, len(handlers))
 	for _, h := range handlers {
 		ts := todayMap[h.ID]
-		todayStart, todaySkip, todaySubmit, todayPend := 0, 0, 0, 0
+		todayStart, todaySkip := 0, 0
 		if ts != nil {
 			todayStart = ts.StartCount
 			todaySkip = ts.SkipCount
-			todaySubmit = ts.SubmitCount
-			todayPend = ts.PendCount
 		}
+		todaySubmit := actionMap[h.ID].SubmitCount
+		todayPend := actionMap[h.ID].PendCount
 
 		username := h.Name
 		realname := h.Name
@@ -95,6 +119,7 @@ type opRecord struct {
 	ID              uint       `json:"id"`
 	TradeID         int64      `json:"tradeId"`
 	ActionType      string     `json:"actionType"`
+	HandledByID     uint       `json:"handledById"`
 	HandledByName   string     `json:"handledByName"`
 	HandledAt       time.Time  `json:"handledAt"`
 	HandleRemark    string     `json:"handleRemark"`
@@ -112,144 +137,131 @@ type opRecord struct {
 	SortKey         time.Time  `json:"-"`
 }
 
-// GetOperatorRecords 分页查询处理记录，合并审核模式（reviews表）和直通模式（trade_abnormals表）
-// 使用 UNION ALL + DB 层 ORDER BY / LIMIT / OFFSET，避免全量加载后在 Go 内存中排序分页
-func GetOperatorRecords(c *gin.Context) {
-	pageStr := c.DefaultQuery("page", "1")
-	sizeStr := c.DefaultQuery("size", "20")
-	userIDStr := c.Query("userId")
-	startDate := c.Query("startDate")
-	endDate := c.Query("endDate")
-	actionType := c.Query("actionType")       // "submit" | "pend" | ""
-	inspectStatus := c.Query("inspectStatus") // "none" | "normal" | "abnormal" | ""
+// operatorRecordFilter describes the only differences between operator and
+// administrator views. The underlying event source is deliberately shared.
+type operatorRecordFilter struct {
+	UserIDs          []uint
+	StartTime        string
+	EndTimeExclusive string
+	EndTimeInclusive string
+	ActionType       string
+	InspectStatus    string
+}
 
-	page, _ := strconv.Atoi(pageStr)
-	size, _ := strconv.Atoi(sizeStr)
-	if page < 1 {
-		page = 1
+func parseShanghaiDate(value string) (time.Time, error) {
+	loc, err := time.LoadLocation("Asia/Shanghai")
+	if err != nil {
+		return time.Time{}, err
 	}
-	if size < 1 {
-		size = 20
+	return time.ParseInLocation("2006-01-02", value, loc)
+}
+
+func parseShanghaiDateTime(value string) (time.Time, error) {
+	loc, err := time.LoadLocation("Asia/Shanghai")
+	if err != nil {
+		return time.Time{}, err
 	}
-
-	var uid uint64
-	if userIDStr != "" {
-		uid, _ = strconv.ParseUint(userIDStr, 10, 64)
+	for _, layout := range []string{"2006-01-02 15:04:05", "2006-01-02 15:04"} {
+		if parsed, parseErr := time.ParseInLocation(layout, value, loc); parseErr == nil {
+			return parsed, nil
+		}
 	}
+	return time.Time{}, &time.ParseError{Layout: "2006-01-02 15:04[:05]", Value: value}
+}
 
-	// reviews 来源仅在 inspectStatus 不要求 "normal"/"abnormal" 时包含
-	needReviews := (actionType == "" || actionType == "submit" || actionType == "pend") &&
-		(inspectStatus == "" || inspectStatus == "none")
-
-	var unionParts []string
-	var unionArgs []interface{}
-
-	// ===== 来源1：审核模式（trade_reviews JOIN trade_abnormals）=====
-	if needReviews {
-		sql := `SELECT r.id, r.trade_id,
-			r.action_type,
-			r.submitted_by_name  AS handled_by_name,
-			r.submitted_at       AS handled_at,
-			r.operator_remark    AS handle_remark,
-			r.goods_json         AS handle_goods,
-			r.review_status,
-			COALESCE(t.is_handled,   0)  AS is_handled,
-			COALESCE(t.out_order_no,'')  AS out_order_no,
-			COALESCE(t.node_name,   '')  AS node_name,
-			COALESCE(t.create_time, '')  AS create_time,
-			'' AS inspect_status, '' AS inspected_by_name, NULL AS inspected_at, '' AS inspect_remark,
-			t.video_duration
-		FROM trade_reviews r
-		LEFT JOIN trade_abnormals t ON t.id = r.trade_id
-		WHERE r.submitted_by_name != '外部系统' AND r.submitted_by_name != ''`
-		var sqlArgs []interface{}
-		if uid > 0 {
-			sql += " AND r.submitted_by_id = ?"
-			sqlArgs = append(sqlArgs, uid)
+// buildOperatorRecordUnion builds the canonical operator-event data set.
+// Review-mode events keep their immutable submission time and action type;
+// direct-mode events use the completed trade and exclude any reviewed trade.
+func buildOperatorRecordUnion(filter operatorRecordFilter) (string, []interface{}) {
+	applyFilters := func(sql string, args []interface{}, userColumn, timeColumn, actionExpr, inspectColumn string) (string, []interface{}) {
+		if len(filter.UserIDs) > 0 {
+			sql += " AND " + userColumn + " IN ?"
+			args = append(args, filter.UserIDs)
 		}
-		if startDate != "" {
-			sql += " AND r.submitted_at >= ?"
-			sqlArgs = append(sqlArgs, startDate+" 00:00:00")
+		if filter.StartTime != "" {
+			sql += " AND " + timeColumn + " >= ?"
+			args = append(args, filter.StartTime)
 		}
-		if endDate != "" {
-			sql += " AND r.submitted_at <= ?"
-			sqlArgs = append(sqlArgs, endDate+" 23:59:59")
+		if filter.EndTimeExclusive != "" {
+			sql += " AND " + timeColumn + " < ?"
+			args = append(args, filter.EndTimeExclusive)
+		} else if filter.EndTimeInclusive != "" {
+			sql += " AND " + timeColumn + " <= ?"
+			args = append(args, filter.EndTimeInclusive)
 		}
-		if actionType != "" {
-			sql += " AND r.action_type = ?"
-			sqlArgs = append(sqlArgs, actionType)
+		if filter.ActionType != "" {
+			sql += " AND " + actionExpr + " = ?"
+			args = append(args, filter.ActionType)
 		}
-		unionParts = append(unionParts, sql)
-		unionArgs = append(unionArgs, sqlArgs...)
-	}
-
-	// ===== 来源2：直通模式（trade_abnormals 排除已在 reviews 中的）=====
-	// 用 NOT EXISTS 关联子查询代替 NOT IN (大列表)，大表时更稳定
-	{
-		notExists := "NOT EXISTS (SELECT 1 FROM trade_reviews r2 WHERE r2.trade_id = t.id"
-		var neArgs []interface{}
-		if uid > 0 {
-			notExists += " AND r2.submitted_by_id = ?"
-			neArgs = append(neArgs, uid)
-		}
-		notExists += ")"
-
-		sql := `SELECT t.id, t.trade_id,
-			CASE WHEN t.pend_status_desc = '已挂起' THEN 'pend' ELSE 'submit' END AS action_type,
-			t.handled_by_name,
-			t.handled_at,
-			t.handle_remark,
-			t.handle_goods,
-			t.review_status,
-			t.is_handled,
-			t.out_order_no, t.node_name, t.create_time,
-			t.inspect_status, t.inspected_by_name, t.inspected_at, t.inspect_remark,
-			t.video_duration
-		FROM trade_abnormals t
-		WHERE t.is_handled = 1 AND t.handled_by_name != '外部系统' AND t.handled_by_name != ''
-		  AND ` + notExists
-		sqlArgs := append([]interface{}{}, neArgs...)
-
-		if uid > 0 {
-			sql += " AND t.handled_by_id = ?"
-			sqlArgs = append(sqlArgs, uid)
-		}
-		if startDate != "" {
-			sql += " AND t.handled_at >= ?"
-			sqlArgs = append(sqlArgs, startDate+" 00:00:00")
-		}
-		if endDate != "" {
-			sql += " AND t.handled_at <= ?"
-			sqlArgs = append(sqlArgs, endDate+" 23:59:59")
-		}
-		switch actionType {
-		case "submit":
-			sql += " AND (t.pend_status_desc != '已挂起' OR t.pend_status_desc IS NULL OR t.pend_status_desc = '')"
-		case "pend":
-			sql += " AND t.pend_status_desc = '已挂起'"
-		}
-		switch inspectStatus {
-		case "none":
-			sql += " AND (t.inspect_status = '' OR t.inspect_status IS NULL)"
+		switch filter.InspectStatus {
+		case "none", "uninspected":
+			sql += " AND (" + inspectColumn + " = '' OR " + inspectColumn + " IS NULL)"
 		case "normal", "abnormal":
-			sql += " AND t.inspect_status = ?"
-			sqlArgs = append(sqlArgs, inspectStatus)
+			sql += " AND " + inspectColumn + " = ?"
+			args = append(args, filter.InspectStatus)
 		}
-		unionParts = append(unionParts, sql)
-		unionArgs = append(unionArgs, sqlArgs...)
+		return sql, args
 	}
 
-	unionSQL := strings.Join(unionParts, "\nUNION ALL\n")
+	reviewSQL := `SELECT t.id, COALESCE(t.trade_id, 0) AS trade_id,
+		r.action_type,
+		r.submitted_by_id AS handled_by_id,
+		r.submitted_by_name AS handled_by_name,
+		r.submitted_at AS handled_at,
+		r.operator_remark AS handle_remark,
+		r.goods_json AS handle_goods,
+		r.review_status,
+		COALESCE(t.is_handled, 0) AS is_handled,
+		COALESCE(t.out_order_no, '') AS out_order_no,
+		COALESCE(t.node_name, '') AS node_name,
+		COALESCE(t.create_time, '') AS create_time,
+		COALESCE(t.inspect_status, '') AS inspect_status,
+		COALESCE(t.inspected_by_name, '') AS inspected_by_name,
+		t.inspected_at,
+		COALESCE(t.inspect_remark, '') AS inspect_remark,
+		t.video_duration
+	FROM trade_reviews r
+	LEFT JOIN trade_abnormals t ON t.id = r.trade_id
+	WHERE r.submitted_by_name != '外部系统' AND r.submitted_by_name != ''`
+	reviewSQL, reviewArgs := applyFilters(reviewSQL, nil, "r.submitted_by_id", "r.submitted_at", "r.action_type", "t.inspect_status")
 
-	// COUNT（复用相同参数）
+	directSQL := `SELECT t.id, t.trade_id,
+		CASE WHEN t.pend_status_desc IN ('已挂起', 'PENDING') THEN 'pend' ELSE 'submit' END AS action_type,
+		t.handled_by_id,
+		t.handled_by_name,
+		t.handled_at,
+		t.handle_remark,
+		t.handle_goods,
+		t.review_status,
+		t.is_handled,
+		t.out_order_no, t.node_name, t.create_time,
+		t.inspect_status, t.inspected_by_name, t.inspected_at, t.inspect_remark,
+		t.video_duration
+	FROM trade_abnormals t
+	WHERE t.is_handled = 1
+	  AND t.handled_by_id IS NOT NULL
+	  AND t.handled_at IS NOT NULL
+	  AND t.handled_by_name != '外部系统'
+	  AND t.handled_by_name != ''
+	  AND NOT EXISTS (SELECT 1 FROM trade_reviews r2 WHERE r2.trade_id = t.id)`
+	directActionExpr := "CASE WHEN t.pend_status_desc IN ('已挂起', 'PENDING') THEN 'pend' ELSE 'submit' END"
+	directSQL, directArgs := applyFilters(directSQL, nil, "t.handled_by_id", "t.handled_at", directActionExpr, "t.inspect_status")
+
+	return reviewSQL + "\nUNION ALL\n" + directSQL, append(reviewArgs, directArgs...)
+}
+
+func queryOperatorRecords(filter operatorRecordFilter, page, size int) ([]opRecord, int64, error) {
+	unionSQL, unionArgs := buildOperatorRecordUnion(filter)
 	var total int64
-	database.DB.Raw("SELECT COUNT(*) FROM ("+unionSQL+") AS _u", unionArgs...).Scan(&total)
+	if err := database.DB.Raw("SELECT COUNT(*) FROM ("+unionSQL+") AS events", unionArgs...).Scan(&total).Error; err != nil {
+		return nil, 0, err
+	}
 
-	// 分页查询：DB 层排序 + LIMIT/OFFSET，只传回一页数据
 	type rawRow struct {
 		ID              uint       `gorm:"column:id"`
 		TradeID         int64      `gorm:"column:trade_id"`
 		ActionType      string     `gorm:"column:action_type"`
+		HandledByID     uint       `gorm:"column:handled_by_id"`
 		HandledByName   string     `gorm:"column:handled_by_name"`
 		HandledAt       *time.Time `gorm:"column:handled_at"`
 		HandleRemark    string     `gorm:"column:handle_remark"`
@@ -266,11 +278,11 @@ func GetOperatorRecords(c *gin.Context) {
 		VideoDuration   *int       `gorm:"column:video_duration"`
 	}
 	offset := (page - 1) * size
-	pagedSQL := "SELECT * FROM (" + unionSQL + ") AS _u ORDER BY handled_at DESC LIMIT ? OFFSET ?"
-	pagedArgs := append(append([]interface{}{}, unionArgs...), size, offset)
-
+	args := append(append([]interface{}{}, unionArgs...), size, offset)
 	var rawRows []rawRow
-	database.DB.Raw(pagedSQL, pagedArgs...).Scan(&rawRows)
+	if err := database.DB.Raw("SELECT * FROM ("+unionSQL+") AS events ORDER BY handled_at DESC LIMIT ? OFFSET ?", args...).Scan(&rawRows).Error; err != nil {
+		return nil, 0, err
+	}
 
 	records := make([]opRecord, 0, len(rawRows))
 	for _, r := range rawRows {
@@ -279,24 +291,98 @@ func GetOperatorRecords(c *gin.Context) {
 			handledAt = *r.HandledAt
 		}
 		records = append(records, opRecord{
-			ID:              r.ID,
-			TradeID:         r.TradeID,
-			ActionType:      r.ActionType,
-			HandledByName:   r.HandledByName,
-			HandledAt:       handledAt,
-			HandleRemark:    r.HandleRemark,
-			HandleGoods:     r.HandleGoods,
-			ReviewStatus:    r.ReviewStatus,
-			IsHandled:       r.IsHandled,
-			OutOrderNo:      r.OutOrderNo,
-			NodeName:        r.NodeName,
-			CreateTime:      r.CreateTime,
-			InspectStatus:   r.InspectStatus,
-			InspectedByName: r.InspectedByName,
-			InspectedAt:     r.InspectedAt,
-			InspectRemark:   r.InspectRemark,
-			VideoDuration:   r.VideoDuration,
+			ID: r.ID, TradeID: r.TradeID, ActionType: r.ActionType,
+			HandledByID: r.HandledByID, HandledByName: r.HandledByName, HandledAt: handledAt,
+			HandleRemark: r.HandleRemark, HandleGoods: r.HandleGoods,
+			ReviewStatus: r.ReviewStatus, IsHandled: r.IsHandled,
+			OutOrderNo: r.OutOrderNo, NodeName: r.NodeName, CreateTime: r.CreateTime,
+			InspectStatus: r.InspectStatus, InspectedByName: r.InspectedByName,
+			InspectedAt: r.InspectedAt, InspectRemark: r.InspectRemark,
+			VideoDuration: r.VideoDuration,
 		})
+	}
+	return records, total, nil
+}
+
+type operatorRecordSummary struct {
+	SubmitCount int64
+	PendCount   int64
+	Amount      float64
+}
+
+func queryOperatorRecordSummary(filter operatorRecordFilter) (operatorRecordSummary, error) {
+	unionSQL, args := buildOperatorRecordUnion(filter)
+	var result operatorRecordSummary
+	if err := database.DB.Raw(`SELECT
+		COALESCE(SUM(CASE WHEN action_type = 'submit' THEN 1 ELSE 0 END), 0) AS submit_count,
+		COALESCE(SUM(CASE WHEN action_type = 'pend' THEN 1 ELSE 0 END), 0) AS pend_count
+		FROM (`+unionSQL+") AS events", args...).Scan(&result).Error; err != nil {
+		return result, err
+	}
+	var amountResult struct {
+		Amount float64 `gorm:"column:amount"`
+	}
+	if err := database.DB.Raw(`SELECT COALESCE(SUM(jt.price * jt.cnt), 0) AS amount
+		FROM (`+unionSQL+`) AS events
+		JOIN JSON_TABLE(
+			CASE WHEN JSON_VALID(events.handle_goods) THEN events.handle_goods ELSE '[]' END,
+			'$[*]' COLUMNS (price DOUBLE PATH '$.goodsPrice', cnt INT PATH '$.goodsCount')
+		) jt ON TRUE
+		WHERE events.action_type = 'submit'`, args...).Scan(&amountResult).Error; err != nil {
+		return result, err
+	}
+	result.Amount = amountResult.Amount
+	return result, nil
+}
+
+// GetOperatorRecords 分页查询处理记录，合并审核模式（reviews表）和直通模式（trade_abnormals表）
+// 使用 UNION ALL + DB 层 ORDER BY / LIMIT / OFFSET，避免全量加载后在 Go 内存中排序分页
+func GetOperatorRecords(c *gin.Context) {
+	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
+	size, _ := strconv.Atoi(c.DefaultQuery("size", "20"))
+	userIDStr := c.Query("userId")
+	startDate := c.Query("startDate")
+	endDate := c.Query("endDate")
+	actionType := c.Query("actionType")       // "submit" | "pend" | ""
+	inspectStatus := c.Query("inspectStatus") // "none" | "normal" | "abnormal" | ""
+
+	if page < 1 {
+		page = 1
+	}
+	if size < 1 {
+		size = 20
+	}
+
+	filter := operatorRecordFilter{ActionType: actionType, InspectStatus: inspectStatus}
+	if userIDStr != "" {
+		uid, err := strconv.ParseUint(userIDStr, 10, 64)
+		if err != nil || uid == 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "无效的用户ID"})
+			return
+		}
+		filter.UserIDs = []uint{uint(uid)}
+	}
+	if startDate != "" {
+		start, err := parseShanghaiDate(startDate)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "开始日期格式错误"})
+			return
+		}
+		filter.StartTime = start.Format("2006-01-02 15:04:05")
+	}
+	if endDate != "" {
+		end, err := parseShanghaiDate(endDate)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "结束日期格式错误"})
+			return
+		}
+		filter.EndTimeExclusive = end.AddDate(0, 0, 1).Format("2006-01-02 15:04:05")
+	}
+
+	records, total, err := queryOperatorRecords(filter, page, size)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "查询处理记录失败"})
+		return
 	}
 
 	c.JSON(http.StatusOK, gin.H{
@@ -310,101 +396,41 @@ func GetOperatorRecords(c *gin.Context) {
 	})
 }
 
-// GetDailyStats 返回每日提交处理和挂起数据，可按 userId 过滤
-// 数据来源：审核模式查 trade_reviews（submitted_at），直通模式查 trade_abnormals（handled_at）
-// 两者按日期合并，保证历史数据准确
+type dailyActionRow struct {
+	Date        string `json:"date" gorm:"column:date"`
+	SubmitCount int    `json:"submitCount" gorm:"column:submit_count"`
+	PendCount   int    `json:"pendCount" gorm:"column:pend_count"`
+}
+
+func queryDailyActionStats(userIDs []uint) ([]dailyActionRow, error) {
+	unionSQL, args := buildOperatorRecordUnion(operatorRecordFilter{UserIDs: userIDs})
+	var rows []dailyActionRow
+	err := database.DB.Raw(`SELECT DATE(handled_at) AS date,
+		SUM(CASE WHEN action_type = 'submit' THEN 1 ELSE 0 END) AS submit_count,
+		SUM(CASE WHEN action_type = 'pend' THEN 1 ELSE 0 END) AS pend_count
+		FROM (`+unionSQL+`) AS events
+		GROUP BY DATE(handled_at)
+		ORDER BY date ASC`, args...).Scan(&rows).Error
+	return rows, err
+}
+
+// GetDailyStats returns the same immutable operator events used by both the
+// administrator record list and the operator's personal page.
 func GetDailyStats(c *gin.Context) {
-	type dailyRow struct {
-		Date        string `json:"date"`
-		SubmitCount int    `json:"submitCount"`
-		PendCount   int    `json:"pendCount"`
-	}
-
-	userIDStr := c.Query("userId")
-	var uid uint64
-	if userIDStr != "" {
-		uid, _ = strconv.ParseUint(userIDStr, 10, 64)
-	}
-
-	// 按日期聚合的 map
-	dayMap := make(map[string]*dailyRow)
-	ensure := func(date string) *dailyRow {
-		if _, ok := dayMap[date]; !ok {
-			dayMap[date] = &dailyRow{Date: date}
+	var userIDs []uint
+	if value := c.Query("userId"); value != "" {
+		uid, err := strconv.ParseUint(value, 10, 64)
+		if err != nil || uid == 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "无效的用户ID"})
+			return
 		}
-		return dayMap[date]
+		userIDs = []uint{uint(uid)}
 	}
-
-	// ===== 来源1：审核模式 —— trade_reviews 表 =====
-	type reviewAgg struct {
-		Date       string
-		ActionType string
-		Cnt        int
+	rows, err := queryDailyActionStats(userIDs)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "查询每日统计失败"})
+		return
 	}
-	var reviewAggs []reviewAgg
-	reviewQ := database.DB.Model(&models.TradeReview{}).
-		Select("DATE(submitted_at) as date, action_type, COUNT(*) as cnt").
-		Where("submitted_by_name != '外部系统' AND submitted_by_name != ''")
-	if uid > 0 {
-		reviewQ = reviewQ.Where("submitted_by_id = ?", uid)
-	}
-	reviewQ.Group("DATE(submitted_at), action_type").Scan(&reviewAggs)
-	for _, r := range reviewAggs {
-		row := ensure(r.Date)
-		if r.ActionType == "pend" {
-			row.PendCount += r.Cnt
-		} else {
-			row.SubmitCount += r.Cnt
-		}
-	}
-
-	// ===== 来源2：直通模式 —— trade_abnormals 表（排除已在 reviews 中的） =====
-	var reviewedTradeIDs []uint
-	reviewIDQ := database.DB.Model(&models.TradeReview{}).Select("trade_id")
-	if uid > 0 {
-		reviewIDQ = reviewIDQ.Where("submitted_by_id = ?", uid)
-	}
-	reviewIDQ.Pluck("trade_id", &reviewedTradeIDs)
-
-	type tradeAgg struct {
-		Date           string
-		PendStatusDesc string
-		Cnt            int
-	}
-	var tradeAggs []tradeAgg
-	directQ := database.DB.Model(&models.TradeAbnormal{}).
-		Select("DATE(handled_at) as date, pend_status_desc, COUNT(*) as cnt").
-		Where("is_handled = 1 AND handled_by_name != '外部系统' AND handled_by_name != '' AND handled_at IS NOT NULL")
-	if len(reviewedTradeIDs) > 0 {
-		directQ = directQ.Where("id NOT IN ?", reviewedTradeIDs)
-	}
-	if uid > 0 {
-		directQ = directQ.Where("handled_by_id = ?", uid)
-	}
-	directQ.Group("DATE(handled_at), pend_status_desc").Scan(&tradeAggs)
-	for _, r := range tradeAggs {
-		row := ensure(r.Date)
-		if r.PendStatusDesc == "已挂起" {
-			row.PendCount += r.Cnt
-		} else {
-			row.SubmitCount += r.Cnt
-		}
-	}
-
-	// 转为有序切片
-	rows := make([]dailyRow, 0, len(dayMap))
-	for _, v := range dayMap {
-		rows = append(rows, *v)
-	}
-	// 按日期升序
-	for i := 0; i < len(rows)-1; i++ {
-		for j := i + 1; j < len(rows); j++ {
-			if rows[j].Date < rows[i].Date {
-				rows[i], rows[j] = rows[j], rows[i]
-			}
-		}
-	}
-
 	c.JSON(http.StatusOK, gin.H{"code": 200, "data": rows})
 }
 
@@ -419,6 +445,14 @@ func GetOperatorRangeStats(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "缺少参数"})
 		return
 	}
+	startAt, startErr := parseShanghaiDateTime(startTime)
+	endAt, endErr := parseShanghaiDateTime(endTime)
+	if startErr != nil || endErr != nil || endAt.Before(startAt) {
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "时间范围格式错误"})
+		return
+	}
+	startTime = startAt.Format("2006-01-02 15:04:05")
+	endTime = endAt.Format("2006-01-02 15:04:05")
 
 	// 解析用户 ID 列表
 	parts := strings.Split(userIDsStr, ",")
@@ -443,8 +477,8 @@ func GetOperatorRangeStats(c *gin.Context) {
 	}
 
 	// ===== 开始/跳过：来自 daily_stats，按日期范围汇总 =====
-	startDate := startTime[:10]
-	endDate := endTime[:10]
+	startDate := startAt.Format("2006-01-02")
+	endDate := endAt.Format("2006-01-02")
 
 	type dailyAgg struct {
 		UserID     uint
@@ -465,53 +499,26 @@ func GetOperatorRangeStats(c *gin.Context) {
 		skipMap[a.UserID] = a.SkipCount
 	}
 
-	// ===== 提交处理/挂起：来源1 —— trade_reviews（审核模式，秒级时间） =====
-	type reviewAgg struct {
-		SubmittedByID uint
-		ActionType    string
-		Cnt           int
+	// ===== 提交处理/挂起：统一操作事件源，保留秒级精度 =====
+	type actionAgg struct {
+		HandledByID uint   `gorm:"column:handled_by_id"`
+		ActionType  string `gorm:"column:action_type"`
+		Cnt         int    `gorm:"column:cnt"`
 	}
-	var reviewAggs []reviewAgg
-	database.DB.Model(&models.TradeReview{}).
-		Select("submitted_by_id, action_type, COUNT(*) as cnt").
-		Where("submitted_by_id IN ? AND submitted_at >= ? AND submitted_at <= ?", userIDs, startTime, endTime).
-		Group("submitted_by_id, action_type").
-		Scan(&reviewAggs)
-
+	unionSQL, unionArgs := buildOperatorRecordUnion(operatorRecordFilter{
+		UserIDs: userIDs, StartTime: startTime, EndTimeInclusive: endTime,
+	})
+	var actionAggs []actionAgg
+	if err := database.DB.Raw(`SELECT handled_by_id, action_type, COUNT(*) AS cnt
+		FROM (`+unionSQL+`) AS events
+		GROUP BY handled_by_id, action_type`, unionArgs...).Scan(&actionAggs).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "查询时段统计失败"})
+		return
+	}
 	submitMap := make(map[uint]int, len(userIDs))
 	pendMap := make(map[uint]int, len(userIDs))
-	for _, a := range reviewAggs {
+	for _, a := range actionAggs {
 		if a.ActionType == "pend" {
-			pendMap[a.SubmittedByID] += a.Cnt
-		} else {
-			submitMap[a.SubmittedByID] += a.Cnt
-		}
-	}
-
-	// ===== 提交处理/挂起：来源2 —— trade_abnormals（直通模式，排除已在 reviews 中的） =====
-	var allReviewedTradeIDs []uint
-	database.DB.Model(&models.TradeReview{}).
-		Select("trade_id").
-		Where("submitted_by_id IN ?", userIDs).
-		Pluck("trade_id", &allReviewedTradeIDs)
-
-	type directAgg struct {
-		HandledByID    uint
-		PendStatusDesc string
-		Cnt            int
-	}
-	var directAggs []directAgg
-	directQ := database.DB.Model(&models.TradeAbnormal{}).
-		Select("handled_by_id, pend_status_desc, COUNT(*) as cnt").
-		Where("handled_by_id IN ? AND is_handled = 1 AND handled_at >= ? AND handled_at <= ?", userIDs, startTime, endTime).
-		Where("handled_by_name != '外部系统' AND handled_by_name != ''")
-	if len(allReviewedTradeIDs) > 0 {
-		directQ = directQ.Where("id NOT IN ?", allReviewedTradeIDs)
-	}
-	directQ.Group("handled_by_id, pend_status_desc").Scan(&directAggs)
-
-	for _, a := range directAggs {
-		if a.PendStatusDesc == "已挂起" {
 			pendMap[a.HandledByID] += a.Cnt
 		} else {
 			submitMap[a.HandledByID] += a.Cnt

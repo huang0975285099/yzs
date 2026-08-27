@@ -56,14 +56,20 @@ func Setup(r *gin.Engine) {
 		auth.GET("/trades/:id/detail", handlers.GetTradeDetail)
 		auth.GET("/trades/:id/branch-products", handlers.QueryBranchProducts)
 		auth.POST("/trades/:id/product-price", handlers.QueryProductPrice)
-		auth.GET("/stats", handlers.GetStats)
-		auth.GET("/stats/operators", handlers.GetOperatorStats)
-		auth.GET("/stats/operator-records", handlers.GetOperatorRecords)
-		auth.GET("/stats/daily", handlers.GetDailyStats)
-		auth.GET("/stats/operator-range", handlers.GetOperatorRangeStats)
-		auth.GET("/stats/inspect-export", handlers.GetInspectExport)
-		auth.GET("/stats/inspectors", handlers.GetInspectorStats)
-		auth.GET("/stats/inspector-range", handlers.GetInspectorRangeStats)
+
+		// Statistics (administrators, statisticians and inspectors only)
+		stats := auth.Group("/stats")
+		stats.Use(middleware.RolesRequired("admin", "statistician", "inspector"))
+		{
+			stats.GET("", handlers.GetStats)
+			stats.GET("/operators", handlers.GetOperatorStats)
+			stats.GET("/operator-records", handlers.GetOperatorRecords)
+			stats.GET("/daily", handlers.GetDailyStats)
+			stats.GET("/operator-range", handlers.GetOperatorRangeStats)
+			stats.GET("/inspect-export", handlers.GetInspectExport)
+			stats.GET("/inspectors", handlers.GetInspectorStats)
+			stats.GET("/inspector-range", handlers.GetInspectorRangeStats)
+		}
 
 		// Quality review
 		auth.GET("/reviews", handlers.ListReviews)

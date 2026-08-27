@@ -121,17 +121,22 @@ func ApproveReview(c *gin.Context) {
 		if review.ReviewRemark != "" {
 			remark = review.ReviewRemark + "；" + remark
 		}
-		database.DB.Model(&trade).Updates(map[string]any{
+		tradeUpdates := map[string]any{
 			"is_handled":      true,
 			"handled_by_id":   review.SubmittedByID,
 			"handled_by_name": review.SubmittedByName,
-			"handled_at":      now,
+			"handled_at":      review.SubmittedAt,
 			"handle_duration": review.Duration,
 			"handle_goods":    review.GoodsJSON,
 			"handle_remark":   review.OperatorRemark,
 			"review_status":   "",
 			"handle_source":   "internal",
-		})
+		}
+		if review.ActionType == "pend" {
+			tradeUpdates["pend_status"] = "PENDING"
+			tradeUpdates["pend_status_desc"] = "已挂起"
+		}
+		database.DB.Model(&trade).Updates(tradeUpdates)
 		database.DB.Model(&review).Updates(map[string]any{
 			"review_status":    "approved",
 			"reviewed_by_id":   user.ID,
@@ -178,7 +183,7 @@ func ApproveReview(c *gin.Context) {
 		"is_handled":      true,
 		"handled_by_id":   review.SubmittedByID,
 		"handled_by_name": review.SubmittedByName,
-		"handled_at":      now,
+		"handled_at":      review.SubmittedAt,
 		"handle_duration": review.Duration,
 		"handle_goods":    review.GoodsJSON,
 		"handle_remark":   review.OperatorRemark,

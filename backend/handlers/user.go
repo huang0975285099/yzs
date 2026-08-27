@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"net/http"
+	"sort"
 	"time"
 
 	"go-yzs/database"
@@ -130,7 +131,8 @@ func DeleteUser(c *gin.Context) {
 
 // incrementDailyStats 增加用户当日统计
 func incrementDailyStats(userID uint, field string) {
-	today := time.Now().Format("2006-01-02")
+	loc, _ := time.LoadLocation("Asia/Shanghai")
+	today := time.Now().In(loc).Format("2006-01-02")
 
 	var stats models.DailyStats
 	err := database.DB.Where("user_id = ? AND date = ?", userID, today).First(&stats).Error
@@ -251,19 +253,64 @@ func GetMyDailyStats(c *gin.Context) {
 	user := c.MustGet("user").(*models.User)
 	date := c.Query("date") // 可选日期参数，格式 YYYY-MM-DD
 
-	// 获取最近30天的统计数据
+	// 开始/跳过仍来自点击计数，提交/挂起统一使用管理员视图的操作事件源。
 	var stats []models.DailyStats
 	database.DB.Where("user_id = ?", user.ID).
-		Order("date DESC").
-		Limit(30).
 		Find(&stats)
+	actionRows, err := queryDailyActionStats([]uint{user.ID})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "查询每日统计失败"})
+		return
+	}
 
 	// 获取指定日期的统计（默认今日）
 	if date == "" {
-		date = time.Now().Format("2006-01-02")
+		loc, _ := time.LoadLocation("Asia/Shanghai")
+		date = time.Now().In(loc).Format("2006-01-02")
+	} else if _, err := parseShanghaiDate(date); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "日期格式错误"})
+		return
 	}
 	var dayStats models.DailyStats
 	database.DB.Where("user_id = ? AND date = ?", user.ID, date).First(&dayStats)
+
+	type dailyStatView struct {
+		Date        string `json:"date"`
+		StartCount  int    `json:"startCount"`
+		SkipCount   int    `json:"skipCount"`
+		SubmitCount int    `json:"submitCount"`
+		PendCount   int    `json:"pendCount"`
+	}
+	historyMap := make(map[string]*dailyStatView, len(stats)+len(actionRows))
+	for _, stat := range stats {
+		historyMap[stat.Date] = &dailyStatView{
+			Date: stat.Date, StartCount: stat.StartCount, SkipCount: stat.SkipCount,
+		}
+	}
+	actionMap := make(map[string]dailyActionRow, len(actionRows))
+	for _, action := range actionRows {
+		actionMap[action.Date] = action
+		row := historyMap[action.Date]
+		if row == nil {
+			row = &dailyStatView{Date: action.Date}
+			historyMap[action.Date] = row
+		}
+		row.SubmitCount = action.SubmitCount
+		row.PendCount = action.PendCount
+	}
+	dates := make([]string, 0, len(historyMap))
+	for day := range historyMap {
+		dates = append(dates, day)
+	}
+	sort.Sort(sort.Reverse(sort.StringSlice(dates)))
+	if len(dates) > 30 {
+		dates = dates[:30]
+	}
+	history := make([]dailyStatView, 0, len(dates))
+	for _, day := range dates {
+		history = append(history, *historyMap[day])
+	}
+	selectedActions := actionMap[date]
 
 	c.JSON(http.StatusOK, gin.H{
 		"code": 200,
@@ -272,10 +319,10 @@ func GetMyDailyStats(c *gin.Context) {
 			"today": gin.H{
 				"startCount":  dayStats.StartCount,
 				"skipCount":   dayStats.SkipCount,
-				"submitCount": dayStats.SubmitCount,
-				"pendCount":   dayStats.PendCount,
+				"submitCount": selectedActions.SubmitCount,
+				"pendCount":   selectedActions.PendCount,
 			},
-			"history": stats,
+			"history": history,
 		},
 	})
 }
