@@ -18,20 +18,20 @@ type TradeAbnormal struct {
 	AbnormalDesc      string    `gorm:"size:200" json:"abnormalDesc"`
 	TradeStatusDesc   string    `gorm:"size:50" json:"tradeStatusDesc"`
 	HandleStatusDesc  string    `gorm:"size:50" json:"handleStatusDesc"`
-	CreateTime        string    `gorm:"size:30" json:"createTime"`
+	CreateTime        string    `gorm:"size:30;index:idx_trade_create_time;index:idx_trade_queue,priority:3" json:"createTime"`
 	DoorOpenTime      string    `gorm:"size:30" json:"doorOpenTime"`
 	DoorCloseTime     string    `gorm:"size:30" json:"doorCloseTime"`
 	AbnormalCode      string    `gorm:"size:20" json:"abnormalCode"`
-	PendStatus        string     `gorm:"size:30" json:"pendStatus"`
-	PendStatusDesc    string     `gorm:"size:50" json:"pendStatusDesc"`
-	Handler           string     `gorm:"size:100" json:"handler"`
-	SyncedAt          time.Time  `json:"syncedAt"`
+	PendStatus        string    `gorm:"size:30" json:"pendStatus"`
+	PendStatusDesc    string    `gorm:"size:50" json:"pendStatusDesc"`
+	Handler           string    `gorm:"size:100" json:"handler"`
+	SyncedAt          time.Time `gorm:"index:idx_trade_synced_at" json:"syncedAt"`
 	// 内部处理信息
-	HandledByID   *uint      `gorm:"index" json:"handledById"`
-	HandledByName string     `gorm:"size:100" json:"handledByName"`
-	HandledAt     *time.Time `gorm:"index" json:"handledAt"`
-	HandleRemark  string     `gorm:"size:500" json:"handleRemark"`
-	IsHandled      bool       `gorm:"default:false;index" json:"isHandled"`
+	HandledByID    *uint      `gorm:"index;index:idx_trade_handler_time,priority:1" json:"handledById"`
+	HandledByName  string     `gorm:"size:100" json:"handledByName"`
+	HandledAt      *time.Time `gorm:"index;index:idx_trade_handler_time,priority:2;index:idx_trade_handled_time,priority:2" json:"handledAt"`
+	HandleRemark   string     `gorm:"size:500" json:"handleRemark"`
+	IsHandled      bool       `gorm:"default:false;index;index:idx_trade_queue,priority:1;index:idx_trade_handled_time,priority:1" json:"isHandled"`
 	HandleDuration int        `gorm:"default:0" json:"handleDuration"`
 	HandleGoods    string     `gorm:"type:text" json:"handleGoods"`
 	HandleSource   string     `gorm:"size:20;default:''" json:"handleSource"`
@@ -41,11 +41,11 @@ type TradeAbnormal struct {
 	LockedByID *uint      `gorm:"index" json:"lockedById"`
 	LockedAt   *time.Time `json:"lockedAt"`
 	// 质检状态（审核模式）
-	ReviewStatus string `gorm:"size:20;default:''" json:"reviewStatus"` // '' 正常, 'pending' 待质检
+	ReviewStatus string `gorm:"size:20;default:'';index:idx_trade_queue,priority:2" json:"reviewStatus"` // '' 正常, 'pending' 待质检
 	// 复查状态（直通模式，质检员事后复查）
-	InspectStatus    string     `gorm:"size:20;default:''" json:"inspectStatus"`    // '' 未复查, 'normal' 正常, 'abnormal' 异常
-	InspectRemark    string     `gorm:"size:500" json:"inspectRemark"`
-	InspectedByID    uint       `gorm:"index" json:"inspectedById"`
-	InspectedByName  string     `gorm:"size:100" json:"inspectedByName"`
-	InspectedAt      *time.Time `json:"inspectedAt"`
+	InspectStatus   string     `gorm:"size:20;default:''" json:"inspectStatus"` // '' 未复查, 'normal' 正常, 'abnormal' 异常
+	InspectRemark   string     `gorm:"size:500" json:"inspectRemark"`
+	InspectedByID   uint       `gorm:"index;index:idx_trade_inspector_time,priority:1" json:"inspectedById"`
+	InspectedByName string     `gorm:"size:100" json:"inspectedByName"`
+	InspectedAt     *time.Time `gorm:"index;index:idx_trade_inspector_time,priority:2" json:"inspectedAt"`
 }

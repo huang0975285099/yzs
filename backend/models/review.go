@@ -9,10 +9,10 @@ type TradeReview struct {
 	GoodsJSON       string        `gorm:"type:text" json:"goodsJson"`
 	OperatorRemark  string        `gorm:"size:500" json:"operatorRemark"`
 	Duration        int           `gorm:"default:0" json:"duration"`
-	SubmittedByID   uint          `gorm:"index" json:"submittedById"`
+	SubmittedByID   uint          `gorm:"index;index:idx_review_submitter_time,priority:1" json:"submittedById"`
 	SubmittedByName string        `gorm:"size:100" json:"submittedByName"`
-	SubmittedAt     time.Time     `gorm:"index" json:"submittedAt"`
-	ReviewStatus    string        `gorm:"size:20;default:'pending'" json:"reviewStatus"` // pending, approved
+	SubmittedAt     time.Time     `gorm:"index;index:idx_review_submitter_time,priority:2" json:"submittedAt"`
+	ReviewStatus    string        `gorm:"size:20;default:'pending';index" json:"reviewStatus"` // pending, approved
 	ReviewedByID    *uint         `json:"reviewedById"`
 	ReviewedByName  string        `gorm:"size:100" json:"reviewedByName"`
 	ReviewedAt      *time.Time    `json:"reviewedAt"`

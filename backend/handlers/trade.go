@@ -3,11 +3,12 @@ package handlers
 import (
 	"go-yzs/database"
 	"go-yzs/models"
-	"log"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
 )
 
 func ListTradeAbnormal(c *gin.Context) {
@@ -15,7 +16,6 @@ func ListTradeAbnormal(c *gin.Context) {
 	size := c.DefaultQuery("size", "20")
 	keyword := c.Query("keyword")
 	isHandled := c.Query("isHandled") // "true" | "false" | ""
-	log.Printf("[ListTradeAbnormal] isHandled=%q", isHandled)
 	abnormalType := c.Query("abnormalTypeDesc")
 	startTime := c.Query("startDate")
 	endTime := c.Query("endDate")
@@ -23,31 +23,49 @@ func ListTradeAbnormal(c *gin.Context) {
 	var records []models.TradeAbnormal
 	var total int64
 
-	query := database.DB.Model(&models.TradeAbnormal{})
-
-	if keyword != "" {
-		like := "%" + keyword + "%"
-		query = query.Where("node_name LIKE ? OR inner_code LIKE ? OR out_order_no LIKE ? OR transaction_id LIKE ?",
-			like, like, like, like)
-	}
-	if isHandled == "true" {
-		query = query.Where("is_handled = 1 AND handled_by_name != '外部系统'")
-	} else if isHandled == "false" {
-		query = query.Where("is_handled = 0 AND review_status = ''")
-	} else if isHandled == "pending" {
-		query = query.Where("review_status = 'pending'")
-	}
-	if abnormalType != "" {
-		query = query.Where("abnormal_type_desc = ?", abnormalType)
-	}
+	startBound, endBound := "", ""
 	if startTime != "" {
-		query = query.Where("create_time >= ?", startTime+" 00:00:00")
+		start, err := parseShanghaiDate(startTime)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "开始日期格式错误"})
+			return
+		}
+		startBound = start.Format("2006-01-02 15:04:05")
 	}
 	if endTime != "" {
-		query = query.Where("create_time <= ?", endTime+" 23:59:59")
+		end, err := parseShanghaiDate(endTime)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "结束日期格式错误"})
+			return
+		}
+		endBound = end.AddDate(0, 0, 1).Format("2006-01-02 15:04:05")
 	}
-
-	query.Count(&total)
+	buildQuery := func() *gorm.DB {
+		query := database.DB.Model(&models.TradeAbnormal{})
+		if keyword != "" {
+			like := "%" + keyword + "%"
+			query = query.Where("node_name LIKE ? OR inner_code LIKE ? OR out_order_no LIKE ? OR transaction_id LIKE ?",
+				like, like, like, like)
+		}
+		switch isHandled {
+		case "true":
+			query = query.Where("is_handled = 1 AND handled_by_name != '外部系统'")
+		case "false":
+			query = query.Where("is_handled = 0 AND review_status = ''")
+		case "pending":
+			query = query.Where("review_status = 'pending'")
+		}
+		if abnormalType != "" {
+			query = query.Where("abnormal_type_desc = ?", abnormalType)
+		}
+		if startBound != "" {
+			query = query.Where("create_time >= ?", startBound)
+		}
+		if endBound != "" {
+			query = query.Where("create_time < ?", endBound)
+		}
+		return query
+	}
 
 	// Convert page/size to int
 	var pageInt, sizeInt int
@@ -59,10 +77,33 @@ func ListTradeAbnormal(c *gin.Context) {
 	}
 
 	offset := (pageInt - 1) * sizeInt
-	query.Order("create_time DESC").Offset(offset).Limit(sizeInt).Find(&records)
-
-	var lastSyncTime *time.Time
-	database.DB.Model(&models.TradeAbnormal{}).Select("MAX(synced_at)").Scan(&lastSyncTime)
+	var lastSync struct {
+		SyncedAt *time.Time
+	}
+	var queryErrors [3]error
+	var wg sync.WaitGroup
+	wg.Add(3)
+	go func() {
+		defer wg.Done()
+		queryErrors[0] = buildQuery().Count(&total).Error
+	}()
+	go func() {
+		defer wg.Done()
+		queryErrors[1] = buildQuery().Order("create_time DESC").Offset(offset).Limit(sizeInt).Find(&records).Error
+	}()
+	go func() {
+		defer wg.Done()
+		queryErrors[2] = database.DB.Model(&models.TradeAbnormal{}).
+			Select("synced_at").Where("synced_at IS NOT NULL").
+			Order("synced_at DESC").Limit(1).Scan(&lastSync).Error
+	}()
+	wg.Wait()
+	for _, err := range queryErrors {
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "查询订单失败"})
+			return
+		}
+	}
 
 	c.JSON(http.StatusOK, gin.H{
 		"code": 200,
@@ -72,7 +113,7 @@ func ListTradeAbnormal(c *gin.Context) {
 			"page":         pageInt,
 			"size":         sizeInt,
 			"pages":        (int(total) + sizeInt - 1) / sizeInt,
-			"lastSyncTime": lastSyncTime,
+			"lastSyncTime": lastSync.SyncedAt,
 		},
 	})
 }
@@ -99,10 +140,20 @@ func GetHourlyStats(c *gin.Context) {
 	}
 
 	if startDate != "" {
-		query = query.Where("create_time >= ?", startDate+" 00:00:00")
+		start, err := parseShanghaiDate(startDate)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "开始日期格式错误"})
+			return
+		}
+		query = query.Where("create_time >= ?", start.Format("2006-01-02 15:04:05"))
 	}
 	if endDate != "" {
-		query = query.Where("create_time <= ?", endDate+" 23:59:59")
+		end, err := parseShanghaiDate(endDate)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "结束日期格式错误"})
+			return
+		}
+		query = query.Where("create_time < ?", end.AddDate(0, 0, 1).Format("2006-01-02 15:04:05"))
 	}
 
 	type HourlyCount struct {

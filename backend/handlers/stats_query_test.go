@@ -1,16 +1,41 @@
 package handlers
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"go-yzs/database"
+	"go-yzs/models"
 
+	"github.com/gin-gonic/gin"
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
 )
+
+func useTestMySQL(t *testing.T) {
+	t.Helper()
+	dsn := os.Getenv("YZS_TEST_MYSQL_DSN")
+	if dsn == "" {
+		t.Skip("YZS_TEST_MYSQL_DSN is not set")
+	}
+	db, err := gorm.Open(mysql.Open(dsn), &gorm.Config{})
+	if err != nil {
+		t.Fatalf("connect test database: %v", err)
+	}
+	previousDB := database.DB
+	database.DB = db
+	t.Cleanup(func() { database.DB = previousDB })
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatalf("get sql database: %v", err)
+	}
+	t.Cleanup(func() { _ = sqlDB.Close() })
+}
 
 func TestBuildOperatorRecordUnionUsesOneCanonicalEventSource(t *testing.T) {
 	filter := operatorRecordFilter{
@@ -46,6 +71,25 @@ func TestBuildOperatorRecordUnionUsesOneCanonicalEventSource(t *testing.T) {
 	}
 }
 
+func TestBuildOperatorActionUnionDoesNotMaterializeWideFields(t *testing.T) {
+	sql, args := buildOperatorActionUnion(operatorRecordFilter{
+		UserIDs: []uint{9}, StartTime: "2026-08-01 00:00:00",
+	})
+	for _, fragment := range []string{"handle_goods", "handle_remark", "operator_remark", "out_order_no", "video_duration"} {
+		if strings.Contains(sql, fragment) {
+			t.Fatalf("narrow action query unexpectedly contains %q", fragment)
+		}
+	}
+	for _, fragment := range []string{"r.submitted_at AS handled_at", "t.handled_at", "action_type", "NOT EXISTS"} {
+		if !strings.Contains(sql, fragment) {
+			t.Fatalf("narrow action query is missing %q", fragment)
+		}
+	}
+	if len(args) != 4 {
+		t.Fatalf("expected two filters for each source, got %d arguments", len(args))
+	}
+}
+
 func TestParseShanghaiDate(t *testing.T) {
 	date, err := parseShanghaiDate("2026-08-26")
 	if err != nil {
@@ -75,25 +119,9 @@ func TestParseShanghaiDateTimeAcceptsMinuteAndSecondPrecision(t *testing.T) {
 }
 
 func TestCanonicalOperatorQueriesAgainstMySQL(t *testing.T) {
-	dsn := os.Getenv("YZS_TEST_MYSQL_DSN")
-	if dsn == "" {
-		t.Skip("YZS_TEST_MYSQL_DSN is not set")
-	}
-	db, err := gorm.Open(mysql.Open(dsn), &gorm.Config{})
-	if err != nil {
-		t.Fatalf("connect test database: %v", err)
-	}
-	previousDB := database.DB
-	database.DB = db
-	t.Cleanup(func() { database.DB = previousDB })
-
-	sqlDB, err := db.DB()
-	if err != nil {
-		t.Fatalf("get sql database: %v", err)
-	}
-	t.Cleanup(func() { _ = sqlDB.Close() })
+	useTestMySQL(t)
 	var videoColumnCount int64
-	if err := db.Raw(`SELECT COUNT(*) FROM information_schema.columns
+	if err := database.DB.Raw(`SELECT COUNT(*) FROM information_schema.columns
 		WHERE table_schema = DATABASE() AND table_name = 'trade_abnormals' AND column_name = 'video_duration'`).Scan(&videoColumnCount).Error; err != nil {
 		t.Fatalf("inspect trade schema: %v", err)
 	}
@@ -139,5 +167,42 @@ func TestCanonicalOperatorQueriesAgainstMySQL(t *testing.T) {
 		SUM(CASE WHEN action_type = 'pend' THEN 1 ELSE 0 END) AS pend_count
 		FROM (`+unionSQL+`) AS events GROUP BY DATE(handled_at)`, args...).Scan(&rows).Error; err != nil {
 		t.Fatalf("query daily aggregation: %v", err)
+	}
+}
+
+func TestReadEndpointPerformanceAgainstMySQL(t *testing.T) {
+	useTestMySQL(t)
+	gin.SetMode(gin.TestMode)
+	admin := &models.User{ID: 1, Role: "admin", Username: "admin"}
+	tests := []struct {
+		name    string
+		url     string
+		handler gin.HandlerFunc
+		user    *models.User
+	}{
+		{name: "operators", url: "/stats/operators", handler: GetOperatorStats},
+		{name: "daily", url: "/stats/daily", handler: GetDailyStats},
+		{name: "inspectors", url: "/stats/inspectors", handler: GetInspectorStats},
+		{name: "stats", url: "/stats", handler: GetStats, user: admin},
+		{name: "unhandled", url: "/trades?isHandled=false&page=1&size=1", handler: ListTradeAbnormal},
+		{name: "trades-by-date", url: "/trades?page=1&size=20&startDate=2026-08-24&endDate=2026-08-26", handler: ListTradeAbnormal},
+		{name: "hourly", url: "/trades/hourly-stats?startDate=2026-08-24&endDate=2026-08-26", handler: GetHourlyStats},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			response := httptest.NewRecorder()
+			context, _ := gin.CreateTestContext(response)
+			context.Request = httptest.NewRequest(http.MethodGet, tt.url, nil)
+			if tt.user != nil {
+				context.Set("user", tt.user)
+			}
+			started := time.Now()
+			tt.handler(context)
+			elapsed := time.Since(started)
+			if response.Code != http.StatusOK {
+				t.Fatalf("status %d: %s", response.Code, response.Body.String())
+			}
+			t.Logf("%s completed in %s (%d bytes)", tt.name, elapsed, response.Body.Len())
+		})
 	}
 }

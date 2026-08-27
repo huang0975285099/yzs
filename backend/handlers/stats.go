@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -18,13 +19,21 @@ func GetOperatorStats(c *gin.Context) {
 
 	// 查询所有有处理事件的用户（审核中和已完成使用同一事实源）
 	type handlerInfo struct {
-		ID   uint
-		Name string
+		ID          uint
+		Name        string
+		TodaySubmit int
+		TodayPend   int
 	}
 	var handlers []handlerInfo
-	allEventsSQL, allEventsArgs := buildOperatorRecordUnion(operatorRecordFilter{})
-	if err := database.DB.Raw(`SELECT handled_by_id AS id, MAX(handled_by_name) AS name
-		FROM (`+allEventsSQL+`) AS events GROUP BY handled_by_id`, allEventsArgs...).Scan(&handlers).Error; err != nil {
+	todayStart, _ := parseShanghaiDate(today)
+	todayStartValue := todayStart.Format("2006-01-02 15:04:05")
+	tomorrowValue := todayStart.AddDate(0, 0, 1).Format("2006-01-02 15:04:05")
+	allEventsSQL, allEventsArgs := buildOperatorActionUnion(operatorRecordFilter{})
+	queryArgs := append([]interface{}{todayStartValue, tomorrowValue, todayStartValue, tomorrowValue}, allEventsArgs...)
+	if err := database.DB.Raw(`SELECT handled_by_id AS id, MAX(handled_by_name) AS name,
+		SUM(CASE WHEN handled_at >= ? AND handled_at < ? AND action_type = 'submit' THEN 1 ELSE 0 END) AS today_submit,
+		SUM(CASE WHEN handled_at >= ? AND handled_at < ? AND action_type = 'pend' THEN 1 ELSE 0 END) AS today_pend
+		FROM (`+allEventsSQL+`) AS events GROUP BY handled_by_id`, queryArgs...).Scan(&handlers).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "查询操作员失败"})
 		return
 	}
@@ -42,38 +51,23 @@ func GetOperatorStats(c *gin.Context) {
 
 	// 今日开始/跳过来自点击计数；提交/挂起来自统一操作事件源。
 	var todayStats []models.DailyStats
-	database.DB.Where("user_id IN ? AND date = ?", ids, today).Find(&todayStats)
+	var users []models.User
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		database.DB.Where("user_id IN ? AND date = ?", ids, today).Find(&todayStats)
+	}()
+	go func() {
+		defer wg.Done()
+		database.DB.Where("id IN ?", ids).Find(&users)
+	}()
+	wg.Wait()
 	todayMap := make(map[uint]*models.DailyStats, len(todayStats))
 	for i := range todayStats {
 		todayMap[todayStats[i].UserID] = &todayStats[i]
 	}
-	todayStart, _ := parseShanghaiDate(today)
-	todayFilter := operatorRecordFilter{
-		StartTime:        todayStart.Format("2006-01-02 15:04:05"),
-		EndTimeExclusive: todayStart.AddDate(0, 0, 1).Format("2006-01-02 15:04:05"),
-	}
-	todayEventsSQL, todayEventsArgs := buildOperatorRecordUnion(todayFilter)
-	type todayAction struct {
-		UserID      uint `gorm:"column:user_id"`
-		SubmitCount int  `gorm:"column:submit_count"`
-		PendCount   int  `gorm:"column:pend_count"`
-	}
-	var todayActions []todayAction
-	if err := database.DB.Raw(`SELECT handled_by_id AS user_id,
-		SUM(CASE WHEN action_type = 'submit' THEN 1 ELSE 0 END) AS submit_count,
-		SUM(CASE WHEN action_type = 'pend' THEN 1 ELSE 0 END) AS pend_count
-		FROM (`+todayEventsSQL+`) AS events GROUP BY handled_by_id`, todayEventsArgs...).Scan(&todayActions).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "查询今日统计失败"})
-		return
-	}
-	actionMap := make(map[uint]todayAction, len(todayActions))
-	for _, action := range todayActions {
-		actionMap[action.UserID] = action
-	}
-
 	// 查询用户信息补充 username 和 realname
-	var users []models.User
-	database.DB.Where("id IN ?", ids).Find(&users)
 	userMap := make(map[uint]*models.User, len(users))
 	for i := range users {
 		userMap[users[i].ID] = &users[i]
@@ -88,9 +82,6 @@ func GetOperatorStats(c *gin.Context) {
 			todayStart = ts.StartCount
 			todaySkip = ts.SkipCount
 		}
-		todaySubmit := actionMap[h.ID].SubmitCount
-		todayPend := actionMap[h.ID].PendCount
-
 		username := h.Name
 		realname := h.Name
 		if u := userMap[h.ID]; u != nil {
@@ -107,8 +98,8 @@ func GetOperatorStats(c *gin.Context) {
 			"realname":    realname,
 			"todayStart":  todayStart,
 			"todaySkip":   todaySkip,
-			"todaySubmit": todaySubmit,
-			"todayPend":   todayPend,
+			"todaySubmit": h.TodaySubmit,
+			"todayPend":   h.TodayPend,
 		})
 	}
 
@@ -169,39 +160,74 @@ func parseShanghaiDateTime(value string) (time.Time, error) {
 	return time.Time{}, &time.ParseError{Layout: "2006-01-02 15:04[:05]", Value: value}
 }
 
+func applyOperatorEventFilters(sql string, args []interface{}, filter operatorRecordFilter, userColumn, timeColumn, actionExpr, inspectColumn string) (string, []interface{}) {
+	if len(filter.UserIDs) > 0 {
+		sql += " AND " + userColumn + " IN ?"
+		args = append(args, filter.UserIDs)
+	}
+	if filter.StartTime != "" {
+		sql += " AND " + timeColumn + " >= ?"
+		args = append(args, filter.StartTime)
+	}
+	if filter.EndTimeExclusive != "" {
+		sql += " AND " + timeColumn + " < ?"
+		args = append(args, filter.EndTimeExclusive)
+	} else if filter.EndTimeInclusive != "" {
+		sql += " AND " + timeColumn + " <= ?"
+		args = append(args, filter.EndTimeInclusive)
+	}
+	if filter.ActionType != "" {
+		sql += " AND " + actionExpr + " = ?"
+		args = append(args, filter.ActionType)
+	}
+	switch filter.InspectStatus {
+	case "none", "uninspected":
+		sql += " AND (" + inspectColumn + " = '' OR " + inspectColumn + " IS NULL)"
+	case "normal", "abnormal":
+		sql += " AND " + inspectColumn + " = ?"
+		args = append(args, filter.InspectStatus)
+	}
+	return sql, args
+}
+
+// buildOperatorActionUnion is the narrow event stream used by aggregations.
+// Avoiding remarks, goods JSON and order-detail columns materially reduces
+// temporary-table I/O for operators, daily, range and dashboard statistics.
+func buildOperatorActionUnion(filter operatorRecordFilter) (string, []interface{}) {
+	reviewSQL := `SELECT
+		r.submitted_by_id AS handled_by_id,
+		r.submitted_by_name AS handled_by_name,
+		r.submitted_at AS handled_at,
+		r.action_type,
+		COALESCE(t.inspect_status, '') AS inspect_status
+	FROM trade_reviews r
+	LEFT JOIN trade_abnormals t ON t.id = r.trade_id
+	WHERE r.submitted_by_name != '外部系统' AND r.submitted_by_name != ''`
+	reviewSQL, reviewArgs := applyOperatorEventFilters(reviewSQL, nil, filter, "r.submitted_by_id", "r.submitted_at", "r.action_type", "t.inspect_status")
+
+	directActionExpr := "CASE WHEN t.pend_status_desc IN ('已挂起', 'PENDING') THEN 'pend' ELSE 'submit' END"
+	directSQL := `SELECT
+		t.handled_by_id,
+		t.handled_by_name,
+		t.handled_at,
+		` + directActionExpr + ` AS action_type,
+		COALESCE(t.inspect_status, '') AS inspect_status
+	FROM trade_abnormals t
+	WHERE t.is_handled = 1
+	  AND t.handled_by_id IS NOT NULL
+	  AND t.handled_at IS NOT NULL
+	  AND t.handled_by_name != '外部系统'
+	  AND t.handled_by_name != ''
+	  AND NOT EXISTS (SELECT 1 FROM trade_reviews r2 WHERE r2.trade_id = t.id)`
+	directSQL, directArgs := applyOperatorEventFilters(directSQL, nil, filter, "t.handled_by_id", "t.handled_at", directActionExpr, "t.inspect_status")
+
+	return reviewSQL + "\nUNION ALL\n" + directSQL, append(reviewArgs, directArgs...)
+}
+
 // buildOperatorRecordUnion builds the canonical operator-event data set.
 // Review-mode events keep their immutable submission time and action type;
 // direct-mode events use the completed trade and exclude any reviewed trade.
 func buildOperatorRecordUnion(filter operatorRecordFilter) (string, []interface{}) {
-	applyFilters := func(sql string, args []interface{}, userColumn, timeColumn, actionExpr, inspectColumn string) (string, []interface{}) {
-		if len(filter.UserIDs) > 0 {
-			sql += " AND " + userColumn + " IN ?"
-			args = append(args, filter.UserIDs)
-		}
-		if filter.StartTime != "" {
-			sql += " AND " + timeColumn + " >= ?"
-			args = append(args, filter.StartTime)
-		}
-		if filter.EndTimeExclusive != "" {
-			sql += " AND " + timeColumn + " < ?"
-			args = append(args, filter.EndTimeExclusive)
-		} else if filter.EndTimeInclusive != "" {
-			sql += " AND " + timeColumn + " <= ?"
-			args = append(args, filter.EndTimeInclusive)
-		}
-		if filter.ActionType != "" {
-			sql += " AND " + actionExpr + " = ?"
-			args = append(args, filter.ActionType)
-		}
-		switch filter.InspectStatus {
-		case "none", "uninspected":
-			sql += " AND (" + inspectColumn + " = '' OR " + inspectColumn + " IS NULL)"
-		case "normal", "abnormal":
-			sql += " AND " + inspectColumn + " = ?"
-			args = append(args, filter.InspectStatus)
-		}
-		return sql, args
-	}
 
 	reviewSQL := `SELECT t.id, COALESCE(t.trade_id, 0) AS trade_id,
 		r.action_type,
@@ -223,7 +249,7 @@ func buildOperatorRecordUnion(filter operatorRecordFilter) (string, []interface{
 	FROM trade_reviews r
 	LEFT JOIN trade_abnormals t ON t.id = r.trade_id
 	WHERE r.submitted_by_name != '外部系统' AND r.submitted_by_name != ''`
-	reviewSQL, reviewArgs := applyFilters(reviewSQL, nil, "r.submitted_by_id", "r.submitted_at", "r.action_type", "t.inspect_status")
+	reviewSQL, reviewArgs := applyOperatorEventFilters(reviewSQL, nil, filter, "r.submitted_by_id", "r.submitted_at", "r.action_type", "t.inspect_status")
 
 	directSQL := `SELECT t.id, t.trade_id,
 		CASE WHEN t.pend_status_desc IN ('已挂起', 'PENDING') THEN 'pend' ELSE 'submit' END AS action_type,
@@ -245,7 +271,7 @@ func buildOperatorRecordUnion(filter operatorRecordFilter) (string, []interface{
 	  AND t.handled_by_name != ''
 	  AND NOT EXISTS (SELECT 1 FROM trade_reviews r2 WHERE r2.trade_id = t.id)`
 	directActionExpr := "CASE WHEN t.pend_status_desc IN ('已挂起', 'PENDING') THEN 'pend' ELSE 'submit' END"
-	directSQL, directArgs := applyFilters(directSQL, nil, "t.handled_by_id", "t.handled_at", directActionExpr, "t.inspect_status")
+	directSQL, directArgs := applyOperatorEventFilters(directSQL, nil, filter, "t.handled_by_id", "t.handled_at", directActionExpr, "t.inspect_status")
 
 	return reviewSQL + "\nUNION ALL\n" + directSQL, append(reviewArgs, directArgs...)
 }
@@ -311,14 +337,15 @@ type operatorRecordSummary struct {
 }
 
 func queryOperatorRecordSummary(filter operatorRecordFilter) (operatorRecordSummary, error) {
-	unionSQL, args := buildOperatorRecordUnion(filter)
+	actionSQL, actionArgs := buildOperatorActionUnion(filter)
 	var result operatorRecordSummary
 	if err := database.DB.Raw(`SELECT
 		COALESCE(SUM(CASE WHEN action_type = 'submit' THEN 1 ELSE 0 END), 0) AS submit_count,
 		COALESCE(SUM(CASE WHEN action_type = 'pend' THEN 1 ELSE 0 END), 0) AS pend_count
-		FROM (`+unionSQL+") AS events", args...).Scan(&result).Error; err != nil {
+		FROM (`+actionSQL+") AS events", actionArgs...).Scan(&result).Error; err != nil {
 		return result, err
 	}
+	unionSQL, args := buildOperatorRecordUnion(filter)
 	var amountResult struct {
 		Amount float64 `gorm:"column:amount"`
 	}
@@ -403,7 +430,7 @@ type dailyActionRow struct {
 }
 
 func queryDailyActionStats(userIDs []uint) ([]dailyActionRow, error) {
-	unionSQL, args := buildOperatorRecordUnion(operatorRecordFilter{UserIDs: userIDs})
+	unionSQL, args := buildOperatorActionUnion(operatorRecordFilter{UserIDs: userIDs})
 	var rows []dailyActionRow
 	err := database.DB.Raw(`SELECT DATE(handled_at) AS date,
 		SUM(CASE WHEN action_type = 'submit' THEN 1 ELSE 0 END) AS submit_count,
@@ -505,7 +532,7 @@ func GetOperatorRangeStats(c *gin.Context) {
 		ActionType  string `gorm:"column:action_type"`
 		Cnt         int    `gorm:"column:cnt"`
 	}
-	unionSQL, unionArgs := buildOperatorRecordUnion(operatorRecordFilter{
+	unionSQL, unionArgs := buildOperatorActionUnion(operatorRecordFilter{
 		UserIDs: userIDs, StartTime: startTime, EndTimeInclusive: endTime,
 	})
 	var actionAggs []actionAgg
@@ -633,12 +660,18 @@ func GetInspectorStats(c *gin.Context) {
 	today := time.Now().In(shanghaiLoc).Format("2006-01-02")
 
 	type inspectorInfo struct {
-		ID   uint
-		Name string
+		ID            uint
+		Name          string
+		TodayNormal   int
+		TodayAbnormal int
 	}
 	var inspectors []inspectorInfo
+	start, _ := parseShanghaiDate(today)
+	end := start.AddDate(0, 0, 1)
 	database.DB.Model(&models.TradeAbnormal{}).
-		Select("inspected_by_id as id, MAX(inspected_by_name) as name").
+		Select(`inspected_by_id AS id, MAX(inspected_by_name) AS name,
+			SUM(CASE WHEN inspected_at >= ? AND inspected_at < ? AND inspect_status = 'normal' THEN 1 ELSE 0 END) AS today_normal,
+			SUM(CASE WHEN inspected_at >= ? AND inspected_at < ? AND inspect_status = 'abnormal' THEN 1 ELSE 0 END) AS today_abnormal`, start, end, start, end).
 		Where("inspected_by_id > 0 AND inspect_status != ''").
 		Group("inspected_by_id").
 		Scan(&inspectors)
@@ -660,42 +693,8 @@ func GetInspectorStats(c *gin.Context) {
 		userMap[users[i].ID] = &users[i]
 	}
 
-	type todayRow struct {
-		InspectedByID uint
-		InspectStatus string
-		Cnt           int
-	}
-	var todayRows []todayRow
-	database.DB.Model(&models.TradeAbnormal{}).
-		Select("inspected_by_id, inspect_status, COUNT(*) as cnt").
-		Where("inspected_by_id IN ? AND inspect_status != '' AND DATE(inspected_at) = ?", ids, today).
-		Group("inspected_by_id, inspect_status").
-		Scan(&todayRows)
-
-	type dayStat struct {
-		Normal   int
-		Abnormal int
-	}
-	todayMap := make(map[uint]*dayStat, len(ids))
-	for _, r := range todayRows {
-		if todayMap[r.InspectedByID] == nil {
-			todayMap[r.InspectedByID] = &dayStat{}
-		}
-		if r.InspectStatus == "normal" {
-			todayMap[r.InspectedByID].Normal += r.Cnt
-		} else if r.InspectStatus == "abnormal" {
-			todayMap[r.InspectedByID].Abnormal += r.Cnt
-		}
-	}
-
 	result := make([]gin.H, 0, len(inspectors))
 	for _, h := range inspectors {
-		ts := todayMap[h.ID]
-		todayNormal, todayAbnormal := 0, 0
-		if ts != nil {
-			todayNormal = ts.Normal
-			todayAbnormal = ts.Abnormal
-		}
 		username, realname := h.Name, h.Name
 		if u := userMap[h.ID]; u != nil {
 			username = u.Username
@@ -708,9 +707,9 @@ func GetInspectorStats(c *gin.Context) {
 			"userId":        h.ID,
 			"username":      username,
 			"realname":      realname,
-			"todayNormal":   todayNormal,
-			"todayAbnormal": todayAbnormal,
-			"todayTotal":    todayNormal + todayAbnormal,
+			"todayNormal":   h.TodayNormal,
+			"todayAbnormal": h.TodayAbnormal,
+			"todayTotal":    h.TodayNormal + h.TodayAbnormal,
 		})
 	}
 

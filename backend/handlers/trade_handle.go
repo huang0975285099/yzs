@@ -531,7 +531,7 @@ func GetStats(c *gin.Context) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			unionSQL, args := buildOperatorRecordUnion(operatorRecordFilter{})
+			unionSQL, args := buildOperatorActionUnion(operatorRecordFilter{})
 			database.DB.Raw(`SELECT handled_by_name AS name, COUNT(*) AS value
 				FROM (`+unionSQL+`) AS events
 				GROUP BY handled_by_id, handled_by_name
