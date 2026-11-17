@@ -8,6 +8,10 @@ set -e
 
 export DOCKER_BUILDKIT=1
 
+# Linux 构建默认使用宿主网络，可按需覆盖。
+BUILD_NETWORK="${BUILD_NETWORK:-host}"
+GOPROXY="${GOPROXY:-https://goproxy.cn|https://proxy.golang.org|direct}"
+
 # 颜色输出
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -39,7 +43,7 @@ clean() {
 # 构建后端镜像
 build_backend() {
     log_info "构建后端镜像 yzs-backend:$VERSION..."
-    docker build -t yzs-backend:$VERSION -t yzs-backend:latest ./backend
+    docker build --network "$BUILD_NETWORK" --build-arg "GOPROXY=$GOPROXY" -t yzs-backend:$VERSION -t yzs-backend:latest ./backend
     
     log_info "导出后端镜像..."
     docker save yzs-backend:$VERSION -o $OUTPUT_DIR/yzs-backend.tar
@@ -51,7 +55,7 @@ build_backend() {
 # 构建前端镜像
 build_frontend() {
     log_info "构建前端镜像 yzs-frontend:$VERSION..."
-    docker build -t yzs-frontend:$VERSION -t yzs-frontend:latest ./frontend
+    docker build --network "$BUILD_NETWORK" -t yzs-frontend:$VERSION -t yzs-frontend:latest ./frontend
     
     log_info "导出前端镜像..."
     docker save yzs-frontend:$VERSION -o $OUTPUT_DIR/yzs-frontend.tar

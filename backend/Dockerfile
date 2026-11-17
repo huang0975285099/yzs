@@ -4,7 +4,8 @@ WORKDIR /app
 
 # Install dependencies
 COPY go.mod go.sum ./
-RUN go env -w GOPROXY=https://goproxy.cn,direct && go mod download
+ARG GOPROXY="https://goproxy.cn|https://proxy.golang.org|direct"
+RUN go env -w GOPROXY="$GOPROXY" && go mod download
 
 COPY . .
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o server .
