@@ -12,6 +12,27 @@ export DOCKER_BUILDKIT=1
 BUILD_NETWORK="${BUILD_NETWORK:-host}"
 GOPROXY="${GOPROXY:-https://goproxy.cn|https://proxy.golang.org|direct}"
 
+# 与 go-proxy/ukeysystem 一致，构建期依赖下载默认走 VPN 代理。
+BUILD_PROXY="${BUILD_PROXY-http://10.66.66.4:6384}"
+while (( $# )); do
+    case "$1" in
+        --proxy)
+            [[ $# -ge 2 ]] || { echo '--proxy 需要 URL（传空字符串禁用）' >&2; exit 1; }
+            BUILD_PROXY="$2"; shift 2 ;;
+        -h|--help)
+            echo '用法: bash build.sh [--proxy URL]（默认使用 VPN 代理；--proxy "" 禁用；构建后自动部署）'
+            exit 0 ;;
+        *) echo "未知参数: $1" >&2; exit 1 ;;
+    esac
+done
+
+# 使用 Docker 内置参数，不将代理写入镜像 ENV；空值覆盖客户端默认代理。
+PROXY_BUILD_ARGS=()
+for proxy_name in HTTP_PROXY HTTPS_PROXY http_proxy https_proxy; do
+    PROXY_BUILD_ARGS+=(--build-arg "$proxy_name=$BUILD_PROXY")
+done
+PROXY_BUILD_ARGS+=(--build-arg ALL_PROXY= --build-arg all_proxy=)
+
 # 颜色输出
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -43,7 +64,7 @@ clean() {
 # 构建后端镜像
 build_backend() {
     log_info "构建后端镜像 yzs-backend:$VERSION..."
-    docker build --network "$BUILD_NETWORK" --build-arg "GOPROXY=$GOPROXY" -t yzs-backend:$VERSION -t yzs-backend:latest ./backend
+    docker build --progress=plain --network "$BUILD_NETWORK" "${PROXY_BUILD_ARGS[@]}" --build-arg "GOPROXY=$GOPROXY" -t yzs-backend:$VERSION -t yzs-backend:latest ./backend
     
     log_info "导出后端镜像..."
     docker save yzs-backend:$VERSION -o $OUTPUT_DIR/yzs-backend.tar
@@ -55,7 +76,7 @@ build_backend() {
 # 构建前端镜像
 build_frontend() {
     log_info "构建前端镜像 yzs-frontend:$VERSION..."
-    docker build --network "$BUILD_NETWORK" -t yzs-frontend:$VERSION -t yzs-frontend:latest ./frontend
+    docker build --progress=plain --network "$BUILD_NETWORK" "${PROXY_BUILD_ARGS[@]}" -t yzs-frontend:$VERSION -t yzs-frontend:latest ./frontend
     
     log_info "导出前端镜像..."
     docker save yzs-frontend:$VERSION -o $OUTPUT_DIR/yzs-frontend.tar
