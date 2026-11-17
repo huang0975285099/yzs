@@ -2,7 +2,10 @@ FROM node:20-alpine AS builder
 
 WORKDIR /app
 COPY package.json package-lock.json* ./
-RUN npm install --registry=https://registry.npmmirror.com
+RUN --mount=type=cache,target=/root/.npm \
+    npm install --registry=https://registry.npmmirror.com \
+    --prefer-offline --no-audit --no-fund --loglevel=http \
+    --fetch-timeout=60000 --fetch-retries=2
 
 COPY . .
 RUN npm run build
