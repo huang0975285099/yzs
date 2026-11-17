@@ -2,10 +2,13 @@ package handlers
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"fmt"
 	"go-yzs/config"
 	"go-yzs/database"
 	"go-yzs/models"
+	"log"
 	"net/http"
 	"sync"
 	"time"
@@ -446,6 +449,20 @@ func ListMyHandled(c *gin.Context) {
 func GetStats(c *gin.Context) {
 	user := c.MustGet("user").(*models.User)
 
+	// 排行只对管理员/统计员可见，缓存按可见范围分 key。
+	scope := "basic"
+	if user.Role == "admin" || user.Role == "statistician" {
+		scope = "full"
+	}
+	cacheKey := "yzs:stats:dashboard:v3:" + scope
+	cacheCtx := context.Background()
+	if cached, err := database.RDB.Get(cacheCtx, cacheKey).Bytes(); err == nil && len(cached) > 0 {
+		c.Data(http.StatusOK, "application/json; charset=utf-8", cached)
+		return
+	}
+
+	started := time.Now()
+
 	shanghaiLoc, _ := time.LoadLocation("Asia/Shanghai")
 	now := time.Now().In(shanghaiLoc)
 	todayStr := now.Format("2006-01-02")
@@ -521,28 +538,19 @@ func GetStats(c *gin.Context) {
 		database.DB.Model(&models.TradeReview{}).Where("review_status = ?", "pending").Count(&pendingReviewCount)
 	}()
 
-	// 5. 操作员累计处理量排行（与操作员个人累计口径一致）
-	type OpStat struct {
-		Name  string `json:"name"`
-		Value int    `json:"value"`
-	}
-	var opStats []OpStat
-	if user.Role == "admin" || user.Role == "statistician" {
+	// 5. 操作员累计处理量排行
+	var opStats []operatorStatRow
+	if scope == "full" {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			unionSQL, args := buildOperatorActionUnion(operatorRecordFilter{})
-			database.DB.Raw(`SELECT handled_by_name AS name, COUNT(*) AS value
-				FROM (`+unionSQL+`) AS events
-				GROUP BY handled_by_id, handled_by_name
-				ORDER BY value DESC
-			`, args...).Scan(&opStats)
+			opStats = loadOperatorStats()
 		}()
 	}
 
 	wg.Wait()
 
-	c.JSON(http.StatusOK, gin.H{
+	payload := gin.H{
 		"code": 200,
 		"data": gin.H{
 			"total":              cr.Total,
@@ -554,5 +562,78 @@ func GetStats(c *gin.Context) {
 			"typeCounts":         typeCounts,
 			"opStats":            opStats,
 		},
-	})
+	}
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		c.JSON(http.StatusOK, payload)
+		return
+	}
+	_ = database.RDB.Set(cacheCtx, cacheKey, body, statsCacheTTL).Err()
+	c.Data(http.StatusOK, "application/json; charset=utf-8", body)
+
+	if elapsed := time.Since(started); elapsed > 2*time.Second {
+		log.Printf("[Stats] dashboard computed in %s (scope=%s)", elapsed.Round(time.Millisecond), scope)
+	}
+}
+
+const statsCacheTTL = 30 * time.Second
+
+type operatorStatRow struct {
+	Name  string `json:"name"`
+	Value int    `json:"value"`
+}
+
+// loadOperatorStats 只按 handled_by_id 聚合，走 idx_trade_handler_time 覆盖索引；
+// 旧实现按 handled_by_name 过滤会回表扫 70 万行（实测 16s）。
+// 姓名从 users 表补，避免再扫一遍大表。
+func loadOperatorStats() []operatorStatRow {
+	type countRow struct {
+		ID    uint `gorm:"column:id"`
+		Value int  `gorm:"column:value"`
+	}
+	var rows []countRow
+	err := database.DB.Raw(`
+		SELECT handled_by_id AS id, COUNT(*) AS value FROM (
+			SELECT r.submitted_by_id AS handled_by_id
+			FROM trade_reviews r
+			WHERE r.submitted_by_name != '外部系统' AND r.submitted_by_name != ''
+			UNION ALL
+			SELECT t.handled_by_id
+			FROM trade_abnormals t
+			WHERE t.handled_by_id IS NOT NULL
+			  AND t.handled_at IS NOT NULL
+			  AND NOT EXISTS (SELECT 1 FROM trade_reviews r2 WHERE r2.trade_id = t.id)
+		) AS events
+		GROUP BY handled_by_id
+		ORDER BY value DESC
+	`).Scan(&rows).Error
+	if err != nil || len(rows) == 0 {
+		return []operatorStatRow{}
+	}
+
+	ids := make([]uint, 0, len(rows))
+	for _, r := range rows {
+		ids = append(ids, r.ID)
+	}
+	var users []models.User
+	database.DB.Select("id, username, realname").Where("id IN ?", ids).Find(&users)
+	names := make(map[uint]string, len(users))
+	for _, u := range users {
+		name := u.Realname
+		if name == "" {
+			name = u.Username
+		}
+		names[u.ID] = name
+	}
+
+	result := make([]operatorStatRow, 0, len(rows))
+	for _, r := range rows {
+		name := names[r.ID]
+		if name == "" {
+			name = fmt.Sprintf("用户%d", r.ID)
+		}
+		result = append(result, operatorStatRow{Name: name, Value: r.Value})
+	}
+	return result
 }

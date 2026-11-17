@@ -608,8 +608,11 @@ async function fetchStats() {
     try {
         const res = await statsApi.operatorStats();
         operatorStats.value = res.data || [];
-    } catch {
-        $q.notify({ type: "negative", message: "加载操作员统计失败" });
+    } catch (err) {
+        $q.notify({
+            type: "negative",
+            message: err?.code === "ECONNABORTED" ? "加载操作员统计超时，请稍后重试" : "加载操作员统计失败",
+        });
     } finally {
         statsLoading.value = false;
     }
@@ -878,8 +881,11 @@ async function fetchInspectorStats() {
     try {
         const res = await statsApi.inspectorStats();
         inspectorStats.value = res.data || [];
-    } catch {
-        $q.notify({ type: "negative", message: "加载质检员统计失败" });
+    } catch (err) {
+        $q.notify({
+            type: "negative",
+            message: err?.code === "ECONNABORTED" ? "加载质检员统计超时，请稍后重试" : "加载质检员统计失败",
+        });
     } finally {
         inspectorLoading.value = false;
     }

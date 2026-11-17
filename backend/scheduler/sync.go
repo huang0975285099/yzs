@@ -16,8 +16,24 @@ import (
 )
 
 const apiURL = "https://api.uboxol.com/lotus/trade/abnormal/page"
-const syncLockKey = "yzs:scheduler:sync:lock"
-const syncLockTTL = 25 * time.Minute
+const pendingLockKey = "yzs:scheduler:sync:lock:pending"
+const handledLockKey = "yzs:scheduler:sync:lock:handled"
+const pendingLockTTL = 6 * time.Minute
+const handledLockTTL = 12 * time.Minute
+const lastSyncKey = "yzs:scheduler:last_sync"
+const triggerGuardKey = "yzs:scheduler:trigger_guard"
+
+// 共享 HTTP 客户端：复用连接，避免每个分页都重新握手 TLS。
+var syncHTTPClient = &http.Client{
+	Timeout: 30 * time.Second,
+	Transport: &http.Transport{
+		Proxy:               http.ProxyFromEnvironment,
+		MaxIdleConns:        20,
+		MaxIdleConnsPerHost: 10,
+		IdleConnTimeout:     90 * time.Second,
+		TLSHandshakeTimeout: 10 * time.Second,
+	},
+}
 
 type apiRequest struct {
 	OperatingModeList []int  `json:"operatingModeList"`
@@ -68,44 +84,97 @@ type apiResponse struct {
 
 func Start() {
 	c := cron.New()
-	c.AddFunc("*/30 * * * *", func() {
-		if !acquireSyncLock() {
-			log.Println("[Scheduler] Another instance is syncing, skipping")
-			return
-		}
-		defer releaseSyncLock()
-		log.Println("[Scheduler] Starting data sync...")
-		if err := SyncData(); err != nil {
-			log.Printf("[Scheduler] Sync error: %v", err)
-		}
-	})
+	// 待处理订单每 2 分钟拉一次，保证坐席取单的实时性；已处理回写每 30 分钟一轮。
+	// 两者使用独立锁，避免回写批次把取单同步堵住。
+	c.AddFunc("*/2 * * * *", func() { runPendingSync("pending") })
+	c.AddFunc("*/30 * * * *", func() { runHandledSync("handled") })
 	c.AddJob("5,35 * * * *", cron.NewChain(
 		cron.SkipIfStillRunning(cron.DefaultLogger),
 	).Then(cron.FuncJob(FillMissingVideoDurations)))
 
 	c.Start()
-	log.Println("[Scheduler] Started, sync every 30 minutes, video fill at :05 and :35")
+	log.Println("[Scheduler] Started, pending sync every 2 minutes, handled sync every 30 minutes, video fill at :05 and :35")
 
 	go func() {
-		if !acquireSyncLock() {
-			log.Println("[Scheduler] Another instance is syncing, skipping initial sync")
-			return
-		}
-		defer releaseSyncLock()
-		log.Println("[Scheduler] Running initial sync...")
-		if err := SyncData(); err != nil {
-			log.Printf("[Scheduler] Initial sync error: %v", err)
-		}
+		runPendingSync("initial")
+		runHandledSync("initial")
 	}()
 
 	// 启动时立即补充一次视频时长（处理积压数据）
 	go FillMissingVideoDurations()
 }
 
-func acquireSyncLock() bool {
+// runSync 完整跑一轮（待处理 + 已处理），保留给手动调用。
+func runSync(label string) {
+	runPendingSync(label)
+	runHandledSync(label)
+}
+
+func runPendingSync(label string) {
+	withLock(pendingLockKey, pendingLockTTL, label+"/pending", syncPending)
+}
+
+func runHandledSync(label string) {
+	withLock(handledLockKey, handledLockTTL, label+"/handled", func() error {
+		syncHandled()
+		return nil
+	})
+}
+
+func withLock(key string, ttl time.Duration, label string, fn func() error) {
+	if !acquireLock(key, ttl) {
+		log.Printf("[Scheduler] %s sync skipped: another instance is running", label)
+		return
+	}
+	defer releaseLock(key)
+
+	started := time.Now()
+	log.Printf("[Scheduler] %s sync start", label)
+	if err := fn(); err != nil {
+		log.Printf("[Scheduler] %s sync failed after %s: %v", label, time.Since(started).Round(time.Second), err)
+		return
+	}
+	markSyncSuccess()
+	log.Printf("[Scheduler] %s sync done in %s", label, time.Since(started).Round(time.Second))
+}
+
+// TriggerAsync 在订单池为空时由接口触发一次补同步。
+// 用独立的 guard key 限频，避免坐席连续刷新打爆外部接口。
+func TriggerAsync() {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	ok, err := database.RDB.SetNX(ctx, syncLockKey, "1", syncLockTTL).Result()
+	ok, err := database.RDB.SetNX(ctx, triggerGuardKey, "1", 2*time.Minute).Result()
+	if err != nil || !ok {
+		return
+	}
+	go runPendingSync("triggered")
+}
+
+func markSyncSuccess() {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	_ = database.RDB.Set(ctx, lastSyncKey, time.Now().Format(time.RFC3339), 7*24*time.Hour).Err()
+}
+
+// LastSuccessTime 返回最近一次完整同步成功的时间；没有记录时返回零值。
+func LastSuccessTime() time.Time {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	raw, err := database.RDB.Get(ctx, lastSyncKey).Result()
+	if err != nil {
+		return time.Time{}
+	}
+	t, err := time.Parse(time.RFC3339, raw)
+	if err != nil {
+		return time.Time{}
+	}
+	return t
+}
+
+func acquireLock(key string, ttl time.Duration) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	ok, err := database.RDB.SetNX(ctx, key, "1", ttl).Result()
 	if err != nil {
 		log.Printf("[Scheduler] Redis lock error: %v, proceeding without lock", err)
 		return true
@@ -113,18 +182,25 @@ func acquireSyncLock() bool {
 	return ok
 }
 
-func releaseSyncLock() {
+func releaseLock(key string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	database.RDB.Del(ctx, syncLockKey)
+	database.RDB.Del(ctx, key)
 }
 
 func SyncData() error {
-	now := time.Now()
-	start := now.AddDate(0, 0, -7)
-	startStr := start.Format("2006-01-02") + " 00:00:00"
-	endStr := now.Format("2006-01-02") + " 23:59:59"
+	if err := syncPending(); err != nil {
+		return err
+	}
+	syncHandled()
+	return nil
+}
 
+// syncPending 只拉未处理订单，用于高频（2 分钟）补充待处理池。
+func syncPending() error {
+	startStr, endStr := syncWindow()
+
+	round1Start := time.Now()
 	n1, new1, err := syncPages(apiRequest{
 		OperatingModeList: []int{21},
 		HandleStatus:      "NOT_HANDLED",
@@ -135,8 +211,15 @@ func SyncData() error {
 	if err != nil {
 		return fmt.Errorf("sync pending error: %w", err)
 	}
-	log.Printf("[Scheduler] Round1 pending: total=%d new=%d", n1, new1)
+	log.Printf("[Scheduler] Round1 pending: total=%d new=%d elapsed=%s", n1, new1, time.Since(round1Start).Round(time.Millisecond))
+	return nil
+}
 
+// syncHandled 回写已处理订单，频率较低（30 分钟）。
+func syncHandled() {
+	startStr, endStr := syncWindow()
+
+	round2Start := time.Now()
 	n2, upd2, err := syncPages(apiRequest{
 		OperatingModeList: []int{21},
 		HandleStatus:      "CUSTOMER_SERVICE_HANDLED",
@@ -147,11 +230,15 @@ func SyncData() error {
 	}, upsertHandled)
 	if err != nil {
 		log.Printf("[Scheduler] Round2 handled error: %v", err)
-	} else {
-		log.Printf("[Scheduler] Round2 handled: total=%d changed=%d", n2, upd2)
+		return
 	}
+	log.Printf("[Scheduler] Round2 handled: total=%d changed=%d elapsed=%s", n2, upd2, time.Since(round2Start).Round(time.Millisecond))
+}
 
-	return nil
+func syncWindow() (string, string) {
+	now := time.Now()
+	start := now.AddDate(0, 0, -7)
+	return start.Format("2006-01-02") + " 00:00:00", now.Format("2006-01-02") + " 23:59:59"
 }
 
 func syncPages(baseReq apiRequest, handle func(apiRecord) (bool, error)) (int, int, error) {
@@ -159,18 +246,42 @@ func syncPages(baseReq apiRequest, handle func(apiRecord) (bool, error)) (int, i
 	current := 1
 	pageSize := 100
 	total := 0
+	pages := 0
+	failedPages := 0
+	consecutiveFailures := 0
+	deadline := time.Now().Add(8 * time.Minute)
 
 	for {
+		if time.Now().After(deadline) {
+			log.Printf("[Scheduler] round exceeded 8m deadline at page %d, stopping early", current)
+			break
+		}
 		baseReq.Current = current
 		baseReq.Size = pageSize
 
 		resp, err := fetchPage(baseReq)
 		if err != nil {
-			return 0, 0, fmt.Errorf("fetchPage error at page %d: %w", current, err)
+			failedPages++
+			consecutiveFailures++
+			log.Printf("[Scheduler] fetchPage error at page %d: %v", current, err)
+			// 第一页失败时拿不到总页数，本轮直接返回；后续页失败则跳过继续，
+			// 避免单页抖动导致整轮同步（包括后面的已处理回写）全部中止。
+			if pages == 0 {
+				return total, count, fmt.Errorf("fetchPage error at page %d: %w", current, err)
+			}
+			// 连续失败说明外部接口整体不可用，立刻收手，避免 170 页 × 3 次重试拖垮整轮。
+			if consecutiveFailures >= 5 {
+				log.Printf("[Scheduler] abort round after %d consecutive page failures", consecutiveFailures)
+				break
+			}
+			if current >= pages {
+				break
+			}
+			current++
+			continue
 		}
-		if !resp.Success {
-			return 0, 0, fmt.Errorf("API returned success=false at page %d", current)
-		}
+		consecutiveFailures = 0
+		pages = resp.Data.Pages
 		total = resp.Data.Total
 
 		for _, r := range resp.Data.Records {
@@ -188,6 +299,9 @@ func syncPages(baseReq apiRequest, handle func(apiRecord) (bool, error)) (int, i
 			break
 		}
 		current++
+	}
+	if failedPages > 0 {
+		log.Printf("[Scheduler] finished with %d failed page(s), processed %d records", failedPages, count)
 	}
 	return total, count, nil
 }
@@ -235,7 +349,8 @@ func upsertHandled(r apiRecord) (bool, error) {
 
 	if err == nil {
 		if existing.HandleSource == "internal" {
-			database.DB.Model(&existing).Update("synced_at", now)
+			// 内部处理的订单不再每轮刷新 synced_at：7 天窗口内有一两万条，
+			// 逐条 UPDATE 会制造大量无意义写入并拖慢整轮同步。
 			return false, nil
 		}
 
@@ -310,16 +425,30 @@ func fetchPage(req apiRequest) (*apiResponse, error) {
 	if err != nil {
 		return nil, err
 	}
-	client := &http.Client{Timeout: 30 * time.Second}
-	httpResp, err := client.Post(apiURL, "application/json", bytes.NewReader(body))
-	if err != nil {
-		return nil, err
-	}
-	defer httpResp.Body.Close()
 
-	var resp apiResponse
-	if err := json.NewDecoder(httpResp.Body).Decode(&resp); err != nil {
-		return nil, err
+	var lastErr error
+	for attempt := 1; attempt <= 3; attempt++ {
+		if attempt > 1 {
+			time.Sleep(time.Duration(attempt-1) * time.Second)
+		}
+		httpResp, err := syncHTTPClient.Post(apiURL, "application/json", bytes.NewReader(body))
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		var resp apiResponse
+		decodeErr := json.NewDecoder(httpResp.Body).Decode(&resp)
+		httpResp.Body.Close()
+		if decodeErr != nil {
+			lastErr = decodeErr
+			continue
+		}
+		if !resp.Success {
+			lastErr = fmt.Errorf("API returned success=false")
+			continue
+		}
+		return &resp, nil
 	}
-	return &resp, nil
+	return nil, lastErr
 }

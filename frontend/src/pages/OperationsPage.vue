@@ -1127,7 +1127,19 @@ async function fetchRandom(redirectsLeft = 5) {
     try {
         for (let lockRetry = 0; lockRetry < 5; lockRetry++) {
             const res = await tradeApi.randomUnhandled();
-            const id = res.data.id;
+            const id = res?.data?.id;
+            if (!id) {
+                const meta = res?.meta || {};
+                let message = res?.message || "暂无待处理订单";
+                if (meta.locked > 0) {
+                    message = `当前 ${meta.locked} 单已被其他坐席锁定，请稍后重试`;
+                } else if (meta.syncTriggered) {
+                    message = "暂无待处理订单，已触发补同步，请稍后重试";
+                }
+                $q.notify({ type: "info", message });
+                detail.value = null;
+                return;
+            }
             try {
                 await tradeApi.lock(id);
             } catch (lockErr) {

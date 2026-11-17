@@ -6,100 +6,58 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
 )
 
-// GetOperatorStats 返回所有有处理记录的用户的统计数据（管理员/统计员可用）
+// GetOperatorStats 返回所有操作员的今日统计（管理员/统计员可用）。
+// 今日提交/挂起直接读 daily_stats，不再为了取当天数字全表扫描 trade_abnormals。
 func GetOperatorStats(c *gin.Context) {
 	shanghaiLoc, _ := time.LoadLocation("Asia/Shanghai")
 	today := time.Now().In(shanghaiLoc).Format("2006-01-02")
 
-	// 查询所有有处理事件的用户（审核中和已完成使用同一事实源）
-	type handlerInfo struct {
-		ID          uint
-		Name        string
-		TodaySubmit int
-		TodayPend   int
+	type operatorRow struct {
+		UserID      uint   `gorm:"column:user_id"`
+		Username    string `gorm:"column:username"`
+		Realname    string `gorm:"column:realname"`
+		TodayStart  int    `gorm:"column:today_start"`
+		TodaySkip   int    `gorm:"column:today_skip"`
+		TodaySubmit int    `gorm:"column:today_submit"`
+		TodayPend   int    `gorm:"column:today_pend"`
 	}
-	var handlers []handlerInfo
-	todayStart, _ := parseShanghaiDate(today)
-	todayStartValue := todayStart.Format("2006-01-02 15:04:05")
-	tomorrowValue := todayStart.AddDate(0, 0, 1).Format("2006-01-02 15:04:05")
-	allEventsSQL, allEventsArgs := buildOperatorActionUnion(operatorRecordFilter{})
-	queryArgs := append([]interface{}{todayStartValue, tomorrowValue, todayStartValue, tomorrowValue}, allEventsArgs...)
-	if err := database.DB.Raw(`SELECT handled_by_id AS id, MAX(handled_by_name) AS name,
-		SUM(CASE WHEN handled_at >= ? AND handled_at < ? AND action_type = 'submit' THEN 1 ELSE 0 END) AS today_submit,
-		SUM(CASE WHEN handled_at >= ? AND handled_at < ? AND action_type = 'pend' THEN 1 ELSE 0 END) AS today_pend
-		FROM (`+allEventsSQL+`) AS events GROUP BY handled_by_id`, queryArgs...).Scan(&handlers).Error; err != nil {
+	var rows []operatorRow
+	err := database.DB.Raw(`
+		SELECT u.id AS user_id, u.username, u.realname,
+			COALESCE(ds.start_count, 0)  AS today_start,
+			COALESCE(ds.skip_count, 0)   AS today_skip,
+			COALESCE(ds.submit_count, 0) AS today_submit,
+			COALESCE(ds.pend_count, 0)   AS today_pend
+		FROM users u
+		LEFT JOIN daily_stats ds ON ds.user_id = u.id AND ds.date = ?
+		WHERE u.deleted_at IS NULL
+		ORDER BY today_submit DESC, today_pend DESC, u.id ASC
+	`, today).Scan(&rows).Error
+	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "查询操作员失败"})
 		return
 	}
 
-	if len(handlers) == 0 {
-		c.JSON(http.StatusOK, gin.H{"code": 200, "data": []gin.H{}})
-		return
-	}
-
-	// 收集用户 ID
-	ids := make([]uint, len(handlers))
-	for i, h := range handlers {
-		ids[i] = h.ID
-	}
-
-	// 今日开始/跳过来自点击计数；提交/挂起来自统一操作事件源。
-	var todayStats []models.DailyStats
-	var users []models.User
-	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		database.DB.Where("user_id IN ? AND date = ?", ids, today).Find(&todayStats)
-	}()
-	go func() {
-		defer wg.Done()
-		database.DB.Where("id IN ?", ids).Find(&users)
-	}()
-	wg.Wait()
-	todayMap := make(map[uint]*models.DailyStats, len(todayStats))
-	for i := range todayStats {
-		todayMap[todayStats[i].UserID] = &todayStats[i]
-	}
-	// 查询用户信息补充 username 和 realname
-	userMap := make(map[uint]*models.User, len(users))
-	for i := range users {
-		userMap[users[i].ID] = &users[i]
-	}
-
-	// 构建结果
-	result := make([]gin.H, 0, len(handlers))
-	for _, h := range handlers {
-		ts := todayMap[h.ID]
-		todayStart, todaySkip := 0, 0
-		if ts != nil {
-			todayStart = ts.StartCount
-			todaySkip = ts.SkipCount
+	result := make([]gin.H, 0, len(rows))
+	for _, r := range rows {
+		realname := r.Realname
+		if realname == "" {
+			realname = r.Username
 		}
-		username := h.Name
-		realname := h.Name
-		if u := userMap[h.ID]; u != nil {
-			username = u.Username
-			realname = u.Realname
-			if realname == "" {
-				realname = u.Username
-			}
-		}
-
 		result = append(result, gin.H{
-			"userId":      h.ID,
-			"username":    username,
+			"userId":      r.UserID,
+			"username":    r.Username,
 			"realname":    realname,
-			"todayStart":  todayStart,
-			"todaySkip":   todaySkip,
-			"todaySubmit": h.TodaySubmit,
-			"todayPend":   h.TodayPend,
+			"todayStart":  r.TodayStart,
+			"todaySkip":   r.TodaySkip,
+			"todaySubmit": r.TodaySubmit,
+			"todayPend":   r.TodayPend,
 		})
 	}
 
@@ -429,32 +387,32 @@ type dailyActionRow struct {
 	PendCount   int    `json:"pendCount" gorm:"column:pend_count"`
 }
 
-func queryDailyActionStats(userIDs []uint) ([]dailyActionRow, error) {
-	unionSQL, args := buildOperatorActionUnion(operatorRecordFilter{UserIDs: userIDs})
-	var rows []dailyActionRow
-	err := database.DB.Raw(`SELECT DATE(handled_at) AS date,
-		SUM(CASE WHEN action_type = 'submit' THEN 1 ELSE 0 END) AS submit_count,
-		SUM(CASE WHEN action_type = 'pend' THEN 1 ELSE 0 END) AS pend_count
-		FROM (`+unionSQL+`) AS events
-		GROUP BY DATE(handled_at)
-		ORDER BY date ASC`, args...).Scan(&rows).Error
-	return rows, err
-}
-
-// GetDailyStats returns the same immutable operator events used by both the
-// administrator record list and the operator's personal page.
+// GetDailyStats 返回最近 30 天每日提交/挂起统计。
+// 直接读 daily_stats 日表，避免为了画趋势图全表扫描 trade_abnormals（实测 16s）。
 func GetDailyStats(c *gin.Context) {
-	var userIDs []uint
+	shanghaiLoc, _ := time.LoadLocation("Asia/Shanghai")
+	startDate := time.Now().In(shanghaiLoc).AddDate(0, 0, -29).Format("2006-01-02")
+
+	var rows []dailyActionRow
+	var query *gorm.DB
 	if value := c.Query("userId"); value != "" {
 		uid, err := strconv.ParseUint(value, 10, 64)
 		if err != nil || uid == 0 {
 			c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "无效的用户ID"})
 			return
 		}
-		userIDs = []uint{uint(uid)}
+		query = database.DB.Table("daily_stats").
+			Select("date, submit_count, pend_count").
+			Where("user_id = ? AND date >= ?", uint(uid), startDate).
+			Order("date ASC")
+	} else {
+		query = database.DB.Table("daily_stats").
+			Select("date, SUM(submit_count) AS submit_count, SUM(pend_count) AS pend_count").
+			Where("date >= ?", startDate).
+			Group("date").
+			Order("date ASC")
 	}
-	rows, err := queryDailyActionStats(userIDs)
-	if err != nil {
+	if err := query.Scan(&rows).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "查询每日统计失败"})
 		return
 	}
@@ -654,62 +612,58 @@ func GetRandomUninspected(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"code": 200, "data": gin.H{"id": result.ID}})
 }
 
-// GetInspectorStats 返回所有有复查记录的质检员统计数据（今日复查正常/异常/总计）
+// GetInspectorStats 返回质检员的今日复查统计（正常/异常/总计）。
+// 只聚合今日的复查记录，不再为取当天数字扫描全部历史（实测 20s）。
 func GetInspectorStats(c *gin.Context) {
 	shanghaiLoc, _ := time.LoadLocation("Asia/Shanghai")
-	today := time.Now().In(shanghaiLoc).Format("2006-01-02")
-
-	type inspectorInfo struct {
-		ID            uint
-		Name          string
-		TodayNormal   int
-		TodayAbnormal int
-	}
-	var inspectors []inspectorInfo
-	start, _ := parseShanghaiDate(today)
+	start, _ := parseShanghaiDate(time.Now().In(shanghaiLoc).Format("2006-01-02"))
 	end := start.AddDate(0, 0, 1)
-	database.DB.Model(&models.TradeAbnormal{}).
-		Select(`inspected_by_id AS id, MAX(inspected_by_name) AS name,
-			SUM(CASE WHEN inspected_at >= ? AND inspected_at < ? AND inspect_status = 'normal' THEN 1 ELSE 0 END) AS today_normal,
-			SUM(CASE WHEN inspected_at >= ? AND inspected_at < ? AND inspect_status = 'abnormal' THEN 1 ELSE 0 END) AS today_abnormal`, start, end, start, end).
-		Where("inspected_by_id > 0 AND inspect_status != ''").
-		Group("inspected_by_id").
-		Scan(&inspectors)
 
-	if len(inspectors) == 0 {
-		c.JSON(http.StatusOK, gin.H{"code": 200, "data": []gin.H{}})
+	type inspectorRow struct {
+		UserID        uint   `gorm:"column:user_id"`
+		Username      string `gorm:"column:username"`
+		Realname      string `gorm:"column:realname"`
+		TodayNormal   int    `gorm:"column:today_normal"`
+		TodayAbnormal int    `gorm:"column:today_abnormal"`
+	}
+	var rows []inspectorRow
+	err := database.DB.Raw(`
+		SELECT u.id AS user_id, u.username, u.realname,
+			COALESCE(a.normal_count, 0)   AS today_normal,
+			COALESCE(a.abnormal_count, 0) AS today_abnormal
+		FROM users u
+		LEFT JOIN (
+			SELECT inspected_by_id AS id,
+				SUM(CASE WHEN inspect_status = 'normal' THEN 1 ELSE 0 END)   AS normal_count,
+				SUM(CASE WHEN inspect_status = 'abnormal' THEN 1 ELSE 0 END) AS abnormal_count
+			FROM trade_abnormals
+			WHERE inspected_at >= ? AND inspected_at < ?
+			  AND inspected_by_id > 0 AND inspect_status != ''
+			GROUP BY inspected_by_id
+		) a ON a.id = u.id
+		WHERE u.deleted_at IS NULL
+		  AND (u.role = 'inspector' OR a.id IS NOT NULL
+		       OR EXISTS (SELECT 1 FROM trade_abnormals h WHERE h.inspected_by_id = u.id LIMIT 1))
+		ORDER BY today_normal + today_abnormal DESC, u.id ASC
+	`, start, end).Scan(&rows).Error
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "查询质检员失败"})
 		return
 	}
 
-	ids := make([]uint, len(inspectors))
-	for i, h := range inspectors {
-		ids[i] = h.ID
-	}
-
-	var users []models.User
-	database.DB.Where("id IN ?", ids).Find(&users)
-	userMap := make(map[uint]*models.User, len(users))
-	for i := range users {
-		userMap[users[i].ID] = &users[i]
-	}
-
-	result := make([]gin.H, 0, len(inspectors))
-	for _, h := range inspectors {
-		username, realname := h.Name, h.Name
-		if u := userMap[h.ID]; u != nil {
-			username = u.Username
-			realname = u.Realname
-			if realname == "" {
-				realname = u.Username
-			}
+	result := make([]gin.H, 0, len(rows))
+	for _, r := range rows {
+		realname := r.Realname
+		if realname == "" {
+			realname = r.Username
 		}
 		result = append(result, gin.H{
-			"userId":        h.ID,
-			"username":      username,
+			"userId":        r.UserID,
+			"username":      r.Username,
 			"realname":      realname,
-			"todayNormal":   h.TodayNormal,
-			"todayAbnormal": h.TodayAbnormal,
-			"todayTotal":    h.TodayNormal + h.TodayAbnormal,
+			"todayNormal":   r.TodayNormal,
+			"todayAbnormal": r.TodayAbnormal,
+			"todayTotal":    r.TodayNormal + r.TodayAbnormal,
 		})
 	}
 

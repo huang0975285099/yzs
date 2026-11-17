@@ -582,8 +582,11 @@ async function fetchRecords() {
             ...qPagination.value,
             rowsNumber: res.data.total || 0,
         };
-    } catch {
-        $q.notify({ type: "negative", message: "加载记录失败" });
+    } catch (err) {
+        $q.notify({
+            type: "negative",
+            message: err?.code === "ECONNABORTED" ? "加载记录超时，请稍后重试" : "加载记录失败",
+        });
     } finally {
         recordsLoading.value = false;
     }

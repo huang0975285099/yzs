@@ -392,8 +392,20 @@ onMounted(() => {
 async function startHandling() {
     try {
         const res = await tradeApi.randomUnhandled();
+        const id = res?.data?.id;
+        if (!id) {
+            const meta = res?.meta || {};
+            let message = res?.message || "暂无待处理订单";
+            if (meta.locked > 0) {
+                message = `当前 ${meta.locked} 单已被其他坐席锁定，请稍后重试`;
+            } else if (meta.syncTriggered) {
+                message = "暂无待处理订单，已触发补同步，请稍后重试";
+            }
+            $q.notify({ type: "info", message });
+            return;
+        }
         authApi.recordStart();
-        router.push({ path: "/app/operations", query: { id: res.data.id } });
+        router.push({ path: "/app/operations", query: { id } });
     } catch (err) {
         $q.notify({
             type: "warning",

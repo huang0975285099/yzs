@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"go-yzs/database"
 	"go-yzs/models"
+	"go-yzs/scheduler"
 	"io"
 	"log"
 	"math/rand"
@@ -35,12 +36,59 @@ func GetRandomUnhandled(c *gin.Context) {
 		Order("create_time ASC"). // 取最早的20条
 		Limit(20).
 		Find(&trades).Error
-	if err != nil || len(trades) == 0 {
-		c.JSON(http.StatusNotFound, gin.H{"code": 404, "message": "暂无待处理订单"})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "查询待处理订单失败"})
+		return
+	}
+	if len(trades) == 0 {
+		respondEmptyPool(c)
 		return
 	}
 	trade := trades[rand.Intn(len(trades))]
 	c.JSON(http.StatusOK, gin.H{"code": 200, "data": gin.H{"id": trade.ID}})
+}
+
+// respondEmptyPool 返回可解释的“空池”状态，而不是笼统的 404。
+// 如果本地长时间没有同步成功，会异步触发一次补同步，避免坐席一直空转。
+func respondEmptyPool(c *gin.Context) {
+	// 三条计数使用与取单相同的事实条件，保证 meta 与空池语义一致。
+	// 均为局部变量：并发请求互不影响。
+	var visible, locked, pendingReview int64
+	database.DB.Model(&models.TradeAbnormal{}).
+		Where("is_handled = ? AND review_status = ''", false).Count(&visible)
+	database.DB.Model(&models.TradeAbnormal{}).
+		Where("is_handled = ? AND review_status = '' AND locked_by_id IS NOT NULL AND locked_at >= ?", false, time.Now().Add(-lockTTL)).
+		Count(&locked)
+	database.DB.Model(&models.TradeAbnormal{}).
+		Where("review_status = ?", "pending").Count(&pendingReview)
+
+	lastSync := scheduler.LastSuccessTime()
+	lastSyncText := ""
+	stale := true
+	if !lastSync.IsZero() {
+		lastSyncText = lastSync.Format("2006-01-02 15:04:05")
+		stale = time.Since(lastSync) > 5*time.Minute
+	}
+
+	// Redis 不可读时 stale 恒为 true，此时退化为“总是尝试触发”，
+	// guard key 同样写在 Redis，也会一并失败，TriggerAsync 自身会静默放弃。
+	triggered := visible == 0 && stale
+	if triggered {
+		scheduler.TriggerAsync()
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"code":    200,
+		"message": "暂无待处理订单",
+		"data":    nil,
+		"meta": gin.H{
+			"unhandled":     visible,
+			"locked":        locked,
+			"pendingReview": pendingReview,
+			"lastSyncTime":  lastSyncText,
+			"syncTriggered": triggered,
+		},
+	})
 }
 
 // GetTradeDetail 代理调用外部 detail 接口 + 商品列表接口，合并返回

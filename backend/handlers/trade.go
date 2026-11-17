@@ -3,6 +3,7 @@ package handlers
 import (
 	"go-yzs/database"
 	"go-yzs/models"
+	"go-yzs/scheduler"
 	"net/http"
 	"sync"
 	"time"
@@ -105,6 +106,14 @@ func ListTradeAbnormal(c *gin.Context) {
 		}
 	}
 
+	// 优先使用调度器记录的最后一次同步成功时间；Redis 无记录时回落到库内 synced_at。
+	var lastSyncTime any
+	if t := scheduler.LastSuccessTime(); !t.IsZero() {
+		lastSyncTime = t
+	} else if lastSync.SyncedAt != nil {
+		lastSyncTime = *lastSync.SyncedAt
+	}
+
 	c.JSON(http.StatusOK, gin.H{
 		"code": 200,
 		"data": gin.H{
@@ -113,7 +122,7 @@ func ListTradeAbnormal(c *gin.Context) {
 			"page":         pageInt,
 			"size":         sizeInt,
 			"pages":        (int(total) + sizeInt - 1) / sizeInt,
-			"lastSyncTime": lastSync.SyncedAt,
+			"lastSyncTime": lastSyncTime,
 		},
 	})
 }

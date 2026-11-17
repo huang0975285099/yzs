@@ -77,13 +77,15 @@ export const tradeApi = {
 }
 
 export const statsApi = {
-  get: () => http.get('/stats'),
-  operatorStats: () => http.get('/stats/operators'),
-  operatorRecords: (params) => http.get('/stats/operator-records', { params }),
-  daily: (params) => http.get('/stats/daily', { params }),
+  // 看板聚合较重，单独放宽超时，避免默认 15s 被前端主动取消
+  get: () => http.get('/stats', { timeout: 45000 }),
+  operatorStats: () => http.get('/stats/operators', { timeout: 30000 }),
+  operatorRecords: (params) =>
+    http.get('/stats/operator-records', { params, timeout: 30000 }),
+  daily: (params) => http.get('/stats/daily', { params, timeout: 30000 }),
   operatorRange: (params) => http.get('/stats/operator-range', { params }),
   inspectExport: (params) => http.get('/stats/inspect-export', { params }),
-  inspectorStats: () => http.get('/stats/inspectors'),
+  inspectorStats: () => http.get('/stats/inspectors', { timeout: 30000 }),
   inspectorRange: (params) => http.get('/stats/inspector-range', { params })
 }
 
